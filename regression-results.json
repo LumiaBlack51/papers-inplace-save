@@ -1,0 +1,38 @@
+{
+  "normal-remove-undo-redo": {
+    "old_exit": 0,
+    "fixed_exit": 0
+  },
+  "stale-after-reload": {
+    "old_exit": 134,
+    "fixed_exit": 0
+  },
+  "duplicate-remove": {
+    "old_exit": 134,
+    "fixed_exit": 0
+  },
+  "idle-empty": {
+    "old_exit": 0,
+    "fixed_exit": 0
+  },
+  "idle-dispose": {
+    "old_exit": 134,
+    "fixed_exit": 0
+  },
+  "idle-refilled": {
+    "old_exit": 134,
+    "fixed_exit": 0
+  },
+  "idle-removed": {
+    "old_exit": 134,
+    "fixed_exit": 0
+  },
+  "idle-reload": {
+    "old_exit": 134,
+    "fixed_exit": 0
+  },
+  "chinese-render-save": {
+    "old_exit": 134,
+    "fixed_exit": 0
+  }
+}

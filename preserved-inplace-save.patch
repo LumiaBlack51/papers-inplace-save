@@ -1,0 +1,98 @@
+--- a/shell/src/document_view/io.rs
++++ b/shell/src/document_view/io.rs
+@@ -355,6 +355,48 @@
+ 
+     pub(super) fn parent_window(&self) -> gtk::Window {
+         self.obj().native().and_downcast::<gtk::Window>().unwrap()
++    }
++
++    pub(super) fn save_in_place(&self) {
++        let Some(file) = self.file.borrow().clone() else {
++            self.save_as();
++            return;
++        };
++
++        self.clear_save_job();
++
++        let document = self.document().unwrap();
++        let uri = file.uri();
++        let save_job = papers_view::JobSave::new(&document, &uri, &uri);
++
++        let id = save_job.connect_finished(glib::clone!(
++            #[weak(rename_to = obj)]
++            self,
++            move |job| {
++                match job.is_succeeded() {
++                    Err(e) => {
++                        obj.error_message(
++                            Some(&e),
++                            &formatx!(
++                                gettext("The file could not be saved as “{}”."),
++                                job.uri().unwrap_or_default(),
++                            )
++                            .expect("Wrong format in translated string"),
++                        );
++                    }
++                    Ok(_) => {
++                        obj.modified.set(false);
++                        obj.update_title();
++                    }
++                }
++
++                obj.clear_save_job();
++            }
++        ));
++
++        self.save_job.replace(Some(save_job.clone()));
++        self.save_job_handler.replace(Some(id));
++        save_job.scheduler_push_job(JobPriority::PriorityNone);
+     }
+ 
+     pub(super) fn save_as(&self) {
+--- a/shell/src/document_view/actions.rs
++++ b/shell/src/document_view/actions.rs
+@@ -151,6 +151,15 @@
+                 ))
+                 .build(),
+             // Document related actions
++            gio::ActionEntryBuilder::new("save")
++                .activate(glib::clone!(
++                    #[weak(rename_to = obj)]
++                    self,
++                    move |_, _, _| {
++                        obj.cmd_save();
++                    }
++                ))
++                .build(),
+             gio::ActionEntryBuilder::new("save-as")
+                 .activate(glib::clone!(
+                     #[weak(rename_to = obj)]
+@@ -973,6 +982,10 @@
+ 
+     fn cmd_rotate_right(&self) {
+         self.rotate(90);
++    }
++
++    fn cmd_save(&self) {
++        self.save_in_place();
+     }
+ 
+     fn cmd_save_as(&self) {
+--- a/shell/src/document_view/signals.rs
++++ b/shell/src/document_view/signals.rs
+@@ -11,6 +11,7 @@
+     #[template_callback]
+     pub(crate) fn doc_restrictions_changed(&self) {
+         let Some(document) = self.document() else {
++            self.set_action_enabled("save", false);
+             self.set_action_enabled("save-as", false);
+             self.set_action_enabled("print", false);
+             return;
+@@ -43,6 +44,7 @@
+             }
+         }
+ 
++        self.set_action_enabled("save", ok_to_copy);
+         self.set_action_enabled("save-as", ok_to_copy);
+         self.set_action_enabled("print", ok_to_print);
+     }

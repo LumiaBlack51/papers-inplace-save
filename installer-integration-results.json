@@ -1,0 +1,17 @@
+[
+  {
+    "step": "install",
+    "exit": 0,
+    "output": "Installing app/org.gnome.Papers/x86_64/inplace-save\n"
+  },
+  {
+    "step": "install",
+    "exit": 0,
+    "output": "Installing app/org.gnome.Papers/x86_64/inplace-save\n"
+  },
+  {
+    "step": "info",
+    "exit": 0,
+    "output": "16573ca27c3e72932f9d7190c3686711c5d489d8c63f80658e6a74267e77e95e\n"
+  }
+]

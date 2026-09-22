@@ -1,0 +1,160 @@
+--- a/libview/context/pps-annotations-context.c
++++ b/libview/context/pps-annotations-context.c
+@@ -772,13 +772,23 @@
+ pps_annotations_context_remove_annotation (PpsAnnotationsContext *self,
+                                            PpsAnnotation *annot)
+ {
+-	PpsAnnotationsContextPrivate *priv = GET_PRIVATE (self);
+-	PpsDocument *document = pps_document_model_get_document (priv->model);
++	PpsAnnotationsContextPrivate *priv;
++	PpsDocument *document;
+ 	guint position;
+ 	PpsAnnotationsContextUndoable *undoable;
+ 
+ 	g_return_if_fail (PPS_IS_ANNOTATIONS_CONTEXT (self));
+ 	g_return_if_fail (PPS_IS_ANNOTATION (annot));
++
++	priv = GET_PRIVATE (self);
++	/* A focus-out deletion can arrive after removal or document reload.
++	 * Reject stale objects before touching the backend or the undo history. */
++	if (!priv->model || !g_list_store_find (priv->annots_model, annot, &position))
++		return;
++
++	document = pps_document_model_get_document (priv->model);
++	if (!PPS_IS_DOCUMENT_ANNOTATIONS (document))
++		return;
+ 
+ 	undoable = g_new0 (PpsAnnotationsContextUndoable, 1);
+ 	undoable->time = g_date_time_new_now_local ();
+@@ -788,8 +798,6 @@
+ 	pps_document_annotations_remove_annotation (PPS_DOCUMENT_ANNOTATIONS (document),
+ 	                                            annot);
+ 
+-	if (!g_list_store_find (priv->annots_model, annot, &position))
+-		g_assert_not_reached ();
+ 
+ 	g_list_store_remove (priv->annots_model, position);
+ 	g_signal_emit (self, signals[SIGNAL_ANNOT_REMOVED], 0, annot);
+--- a/libview/pps-annotation-overlay.c
++++ b/libview/pps-annotation-overlay.c
+@@ -48,6 +48,7 @@
+ 	GtkTextView *text_view;
+ 
+ 	gboolean ignore_content_changed;
++	guint remove_annot_idle_id;
+ } PpsOverlayAnnotationEntryPrivate;
+ 
+ struct _PpsOverlayAnnotationEntry {
+@@ -521,6 +522,52 @@
+ 	gtk_widget_queue_resize (GTK_WIDGET (entry));
+ }
+ 
++/* Poppler FreeText uses a single font, unlike the GTK editor's automatic
++ * fallback runs. Select a fallback only when it covers the complete text so
++ * leaving the editor does not turn supported editor text into an empty PDF. */
++static void
++pps_overlay_annotation_entry_ensure_font (PpsOverlayAnnotationEntry *entry,
++                                          const gchar *text)
++{
++	PpsOverlayAnnotationPrivate *priv = OVERLAY_GET_PRIVATE (entry);
++	PpsAnnotationFreeText *annot = PPS_ANNOTATION_FREE_TEXT (priv->annotation);
++	PangoContext *context = gtk_widget_get_pango_context (GTK_WIDGET (entry));
++	g_autoptr (PangoFontDescription) desc = pps_annotation_free_text_get_font_description (annot);
++	g_autoptr (PangoFont) font = pango_context_load_font (context, desc);
++	gunichar missing = 0;
++
++	if (!text || !font)
++		return;
++
++	for (const gchar *p = text; *p; p = g_utf8_next_char (p)) {
++		gunichar ch = g_utf8_get_char (p);
++		if (!g_unichar_isspace (ch) && !g_unichar_iscntrl (ch) && !pango_font_has_char (font, ch)) {
++			missing = ch;
++			break;
++		}
++	}
++	if (!missing)
++		return;
++
++	PangoFontset *fonts = pango_context_load_fontset (context, desc, pango_context_get_language (context));
++	if (!fonts)
++		return;
++	g_autoptr (PangoFont) fallback = pango_fontset_get_font (fonts, missing);
++	g_object_unref (fonts);
++	if (!fallback)
++		return;
++
++	for (const gchar *p = text; *p; p = g_utf8_next_char (p)) {
++		gunichar ch = g_utf8_get_char (p);
++		if (!g_unichar_isspace (ch) && !g_unichar_iscntrl (ch) && !pango_font_has_char (fallback, ch))
++			return;
++	}
++
++	g_autoptr (PangoFontDescription) fallback_desc = pango_font_describe (fallback);
++	pango_font_description_set_family (desc, pango_font_description_get_family (fallback_desc));
++	pps_annotation_free_text_set_font_description (annot, desc);
++}
++
+ static void
+ pps_overlay_annotation_entry_text_changed (GtkTextBuffer *buffer, PpsOverlayAnnotationEntry *entry)
+ {
+@@ -539,6 +586,7 @@
+ 
+ 	priv_entry->ignore_content_changed = TRUE;
+ 
++	pps_overlay_annotation_entry_ensure_font (entry, text);
+ 	if (pps_annotation_set_contents (priv->annotation, text)) {
+ 		pps_overlay_annotation_entry_resize (priv->annotation, NULL, entry);
+ 	}
+@@ -551,8 +599,13 @@
+ 
+ 	PpsOverlayAnnotation *overlay = PPS_OVERLAY_ANNOTATION (entry);
+ 	PpsOverlayAnnotationPrivate *priv = OVERLAY_GET_PRIVATE (overlay);
+-	pps_annotations_context_remove_annotation (priv->annots_context, priv->annotation);
+-	return FALSE;
++	PpsOverlayAnnotationEntryPrivate *priv_entry = ENTRY_GET_PRIVATE (entry);
++
++	priv_entry->remove_annot_idle_id = 0;
++	/* Contents may have changed since focus left the text view. */
++	if (!priv->annot_removed && !g_strcmp0 (pps_annotation_get_contents (priv->annotation), ""))
++		pps_annotations_context_remove_annotation (priv->annots_context, priv->annotation);
++	return G_SOURCE_REMOVE;
+ }
+ 
+ static void
+@@ -561,13 +614,14 @@
+ 	PpsOverlayAnnotation *overlay = PPS_OVERLAY_ANNOTATION (entry);
+ 	PpsOverlayAnnotationPrivate *priv = OVERLAY_GET_PRIVATE (overlay);
+ 
+-	if (!priv->annot_removed) {
++	PpsOverlayAnnotationEntryPrivate *priv_entry = ENTRY_GET_PRIVATE (entry);
++
++	if (!priv->annot_removed && !priv_entry->remove_annot_idle_id) {
+ 		if (!g_strcmp0 (pps_annotation_get_contents (PPS_ANNOTATION (priv->annotation)), "")) {
+-			priv->annot_removed = TRUE;
+ 			// remove at next tick because we are in the middle of processing
+ 			// a focus event and removing the annotation now may result in the widget being
+ 			// destroyed
+-			g_idle_add_once ((GSourceOnceFunc) remove_annot, entry);
++			priv_entry->remove_annot_idle_id = g_idle_add ((GSourceFunc) remove_annot, entry);
+ 		}
+ 	}
+ }
+@@ -752,6 +806,7 @@
+ 	buffer = gtk_text_view_get_buffer (priv->text_view);
+ 
+ 	txt = pps_annotation_get_contents (annot);
++	pps_overlay_annotation_entry_ensure_font (entry, txt);
+ 	if (txt) {
+ 		gtk_text_buffer_set_text (buffer, txt, -1);
+ 	}
+@@ -766,6 +821,9 @@
+ {
+ 	PpsOverlayAnnotationEntry *entry = PPS_OVERLAY_ANNOTATION_ENTRY (object);
+ 	PpsOverlayAnnotationPrivate *priv = OVERLAY_GET_PRIVATE (object);
++	PpsOverlayAnnotationEntryPrivate *priv_entry = ENTRY_GET_PRIVATE (entry);
++
++	g_clear_handle_id (&priv_entry->remove_annot_idle_id, g_source_remove);
+ 
+ 	g_signal_handlers_disconnect_by_func (
+ 	    priv->annotation, G_CALLBACK (pps_overlay_annotation_entry_resize), entry);

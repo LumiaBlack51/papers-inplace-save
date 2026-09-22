@@ -1,0 +1,9 @@
+/build*/
+/dist/
+/.flatpak-builder/
+/staging/
+/repo/
+/chinese-save-check.png
+*.flatpak
+*.deb
+__pycache__/
