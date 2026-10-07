@@ -1,7 +1,7 @@
 #!/bin/sh
 set -eu
 bundle=/usr/share/papers-inplace-save/papers-fixed.flatpak
-expected_commit=16573ca27c3e72932f9d7190c3686711c5d489d8c63f80658e6a74267e77e95e
+expected_commit=7f440512d1e8e2cd7e0065f1cda7c29f60079cf9c9db0e6a0b671edd8d3b90bb
 if [ "$(id -u)" = 0 ]; then
     echo 'Run papers-inplace-save as your desktop user, without sudo.' >&2
     exit 1
@@ -16,7 +16,7 @@ esac
 current=$(flatpak info --user --show-commit org.gnome.Papers//inplace-save 2>/dev/null || true)
 if [ "$current" != "$expected_commit" ]; then
     [ -r "$bundle" ] || { echo "Missing package payload: $bundle" >&2; exit 1; }
-    echo 'Installing Papers 50.2 with in-place save, annotation lifecycle and font fixes.'
+    echo 'Installing Papers 50.2 with in-place save without refresh, annotation lifecycle and font fixes.'
     echo 'Application data is retained; already-open windows continue using their old version.'
     # Update the existing branch without uninstalling it or deleting user data.
     flatpak install --user --noninteractive --or-update --no-related "$bundle"
