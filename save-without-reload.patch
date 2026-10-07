@@ -1,0 +1,559 @@
+diff --git a/shell/src/document_view/io.rs b/shell/src/document_view/io.rs
+index 05c0f18..0c14179 100644
+--- a/shell/src/document_view/io.rs
++++ b/shell/src/document_view/io.rs
+@@ -358,6 +358,12 @@ impl imp::PpsDocumentView {
+     }
+ 
+     pub(super) fn save_in_place(&self) {
++        // Cancelling JobSave does not interrupt a write already running in the
++        // worker thread. Keep one save active, and its monitor guard alive.
++        if self.save_job.borrow().is_some() {
++            return;
++        }
++
+         let Some(file) = self.file.borrow().clone() else {
+             self.save_as();
+             return;
+@@ -368,11 +374,19 @@ impl imp::PpsDocumentView {
+         let document = self.document().unwrap();
+         let uri = file.uri();
+         let save_job = papers_view::JobSave::new(&document, &uri, &uri);
++        let monitor_guard = self
++            .parent_window()
++            .downcast::<PpsWindow>()
++            .unwrap()
++            .suspend_file_monitor(&file);
+ 
+         let id = save_job.connect_finished(glib::clone!(
+             #[weak(rename_to = obj)]
+             self,
+             move |job| {
++                // Retain the guard through completion and error handling. It is
++                // released when clear_save_job disconnects this callback.
++                let _guard = &monitor_guard;
+                 match job.is_succeeded() {
+                     Err(e) => {
+                         obj.error_message(
+@@ -400,6 +414,10 @@ impl imp::PpsDocumentView {
+     }
+ 
+     pub(super) fn save_as(&self) {
++        if self.save_job.borrow().is_some() {
++            return;
++        }
++
+         let dialog = gtk::FileDialog::builder()
+             .title(gettext("Save As…"))
+             .modal(true)
+@@ -418,6 +436,10 @@ impl imp::PpsDocumentView {
+                 match result {
+                     Err(_) => obj.close_after_save.set(false),
+                     Ok(file) => {
++                        if obj.save_job.borrow().is_some() {
++                            obj.close_after_save.set(false);
++                            return;
++                        }
+                         obj.file_dialog_save_folder(Some(&file), UserDirectory::Documents);
+ 
+                         obj.clear_save_job();
+@@ -427,11 +449,17 @@ impl imp::PpsDocumentView {
+                         let document_uri = obj.file.borrow().as_ref().unwrap().uri();
+ 
+                         let save_job = papers_view::JobSave::new(&document, &uri, &document_uri);
++                        let monitor_guard = obj
++                            .parent_window()
++                            .downcast::<PpsWindow>()
++                            .unwrap()
++                            .suspend_file_monitor(&file);
+ 
+                         let id = save_job.connect_finished(glib::clone!(
+                             #[weak]
+                             obj,
+                             move |job| {
++                                let _guard = &monitor_guard;
+                                 match job.is_succeeded() {
+                                     Err(e) => {
+                                         obj.close_after_save.set(false);
+diff --git a/shell/src/file_monitor.rs b/shell/src/file_monitor.rs
+index ffe20b5..34e7257 100644
+--- a/shell/src/file_monitor.rs
++++ b/shell/src/file_monitor.rs
+@@ -1,4 +1,5 @@
+ use super::*;
++use std::cell::Cell;
+ 
+ mod imp {
+     use super::*;
+@@ -8,8 +9,10 @@ mod imp {
+     pub struct PpsFileMonitor {
+         #[property(construct_only, get)]
+         pub(super) uri: RefCell<String>,
+-        pub(super) monitor: std::cell::OnceCell<gio::FileMonitor>,
++        pub(super) monitor: RefCell<Option<gio::FileMonitor>>,
+         pub(super) timeout_id: RefCell<Option<glib::SourceId>>,
++        pub(super) suspend_count: Cell<u32>,
++        pub(super) generation: Cell<u64>,
+     }
+ 
+     #[glib::object_subclass]
+@@ -27,13 +30,28 @@ mod imp {
+         }
+ 
+         fn constructed(&self) {
++            self.start();
++        }
++
++        fn dispose(&self) {
++            self.stop();
++        }
++    }
++
++    impl PpsFileMonitor {
++        pub(super) fn start(&self) {
+             let file = gio::File::for_uri(self.uri.borrow().as_ref());
+             match file.monitor_file(gio::FileMonitorFlags::NONE, gio::Cancellable::NONE) {
+                 Ok(monitor) => {
+                     monitor.connect_changed(glib::clone!(
+                         #[weak(rename_to = obj)]
+                         self,
+-                        move |_, _, _, event| {
++                        move |monitor, _, _, event| {
++                            // Events already queued by a cancelled monitor must not reload
++                            // a document after its own save has finished.
++                            if monitor.is_cancelled() {
++                                return;
++                            }
+                             match event {
+                                 gio::FileMonitorEvent::ChangesDoneHint => {
+                                     obj.timeout_stop();
+@@ -45,7 +63,7 @@ mod imp {
+                         }
+                     ));
+ 
+-                    self.monitor.set(monitor).unwrap();
++                    self.monitor.replace(Some(monitor));
+                 }
+                 Err(e) => {
+                     glib::g_warning!("", "{}", e.message());
+@@ -53,12 +71,12 @@ mod imp {
+             }
+         }
+ 
+-        fn dispose(&self) {
++        pub(super) fn stop(&self) {
+             self.timeout_stop();
++            if let Some(monitor) = self.monitor.take() {
++                monitor.cancel();
++            }
+         }
+-    }
+-
+-    impl PpsFileMonitor {
+         fn timeout_start(&self) {
+             self.timeout_stop();
+ 
+@@ -93,4 +111,151 @@ impl PpsFileMonitor {
+     pub fn new(uri: &str) -> Self {
+         glib::Object::builder().property("uri", uri).build()
+     }
++
++    pub fn is_suspended(&self) -> bool {
++        self.imp().suspend_count.get() > 0
++    }
++
++    pub fn generation(&self) -> u64 {
++        self.imp().generation.get()
++    }
++
++    pub fn suspend(&self) -> FileMonitorGuard {
++        let imp = self.imp();
++        imp.suspend_count.set(imp.suspend_count.get() + 1);
++        imp.generation.set(imp.generation.get().wrapping_add(1));
++        imp.stop();
++        FileMonitorGuard(self.clone())
++    }
++}
++
++// Keep the monitor suspended until the save callback is disconnected, including
++// error paths. A fresh monitor cannot receive notifications from the old write.
++pub struct FileMonitorGuard(PpsFileMonitor);
++
++impl Drop for FileMonitorGuard {
++    fn drop(&mut self) {
++        let imp = self.0.imp();
++        let count = imp.suspend_count.get() - 1;
++        imp.suspend_count.set(count);
++        if count == 0 {
++            imp.start();
++        }
++    }
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++    use std::rc::Rc;
++    use std::time::{Duration, Instant};
++
++    fn pump_for(duration: Duration) {
++        let context = glib::MainContext::default();
++        let until = Instant::now() + duration;
++        while Instant::now() < until {
++            while context.pending() {
++                context.iteration(false);
++            }
++            std::thread::sleep(Duration::from_millis(5));
++        }
++    }
++
++    #[test]
++    fn own_write_and_queued_events_are_ignored_but_external_writes_resume() {
++        let context = glib::MainContext::default();
++        let _context = context.acquire().unwrap();
++        let path = std::env::temp_dir().join(format!("papers-monitor-{}", std::process::id()));
++        std::fs::write(&path, b"original").unwrap();
++        let file = gio::File::for_path(&path);
++        let monitor = PpsFileMonitor::new(&file.uri());
++        let changes = Rc::new(Cell::new(0));
++        monitor.connect_closure(
++            "changed",
++            false,
++            glib::closure_local!(
++                #[strong]
++                changes,
++                move |_: PpsFileMonitor| changes.set(changes.get() + 1)
++            ),
++        );
++
++        for _ in 0..3 {
++            let old = monitor.imp().monitor.borrow().clone().unwrap();
++            let generation = monitor.generation();
++            let guard = monitor.suspend();
++            let nested_guard = monitor.suspend();
++            assert!(old.is_cancelled());
++            std::fs::write(&path, b"own save").unwrap();
++            pump_for(Duration::from_millis(300));
++            assert_eq!(changes.get(), 0);
++            drop(guard);
++            assert!(monitor.is_suspended());
++            drop(nested_guard);
++            assert!(!monitor.is_suspended());
++            assert_ne!(monitor.generation(), generation);
++
++            // Deliver a notification from the old monitor after save completion.
++            old.emit_by_name::<()>(
++                "changed",
++                &[
++                    &file,
++                    &Option::<gio::File>::None,
++                    &gio::FileMonitorEvent::ChangesDoneHint,
++                ],
++            );
++            pump_for(Duration::from_millis(300));
++            assert_eq!(changes.get(), 0);
++        }
++
++        std::fs::write(&path, b"external update after save").unwrap();
++        let deadline = Instant::now() + Duration::from_secs(3);
++        while changes.get() == 0 && Instant::now() < deadline {
++            pump_for(Duration::from_millis(20));
++        }
++        assert!(changes.get() > 0, "external updates must still be detected");
++        monitor.imp().stop();
++        std::fs::remove_file(path).unwrap();
++    }
++
++    #[test]
++    fn suspending_cancels_the_pending_reload_timeout() {
++        let context = glib::MainContext::default();
++        let _context = context.acquire().unwrap();
++        let path = std::env::temp_dir().join(format!("papers-timeout-{}", std::process::id()));
++        std::fs::write(&path, b"original").unwrap();
++        let file = gio::File::for_path(&path);
++        let monitor = PpsFileMonitor::new(&file.uri());
++        let changes = Rc::new(Cell::new(0));
++        monitor.connect_closure(
++            "changed",
++            false,
++            glib::closure_local!(
++                #[strong]
++                changes,
++                move |_: PpsFileMonitor| changes.set(changes.get() + 1)
++            ),
++        );
++        monitor
++            .imp()
++            .monitor
++            .borrow()
++            .as_ref()
++            .unwrap()
++            .emit_by_name::<()>(
++                "changed",
++                &[
++                    &file,
++                    &Option::<gio::File>::None,
++                    &gio::FileMonitorEvent::Changed,
++                ],
++            );
++        assert!(monitor.imp().timeout_id.borrow().is_some());
++        drop(monitor.suspend());
++        assert!(monitor.imp().timeout_id.borrow().is_none());
++        pump_for(Duration::from_secs(6));
++        assert_eq!(changes.get(), 0);
++        monitor.imp().stop();
++        std::fs::remove_file(path).unwrap();
++    }
+ }
+diff --git a/shell/src/window.rs b/shell/src/window.rs
+index 83f4917..b9feefc 100644
+--- a/shell/src/window.rs
++++ b/shell/src/window.rs
+@@ -180,6 +180,20 @@ mod imp {
+             }
+         }
+ 
++        pub(super) fn suspend_file_monitor(
++            &self,
++            file: &gio::File,
++        ) -> Option<crate::file_monitor::FileMonitorGuard> {
++            let monitor = self.monitor.borrow().clone()?;
++            if !gio::File::for_uri(&monitor.uri()).equal(file) {
++                return None;
++            }
++
++            let guard = monitor.suspend();
++            self.clear_reload_job();
++            Some(guard)
++        }
++
+         fn set_mode(&self, mode: WindowRunMode) {
+             if self.mode.get() == mode {
+                 return;
+@@ -768,11 +782,22 @@ mod imp {
+         }
+ 
+         fn file_changed(&self) {
++            let monitor = self.monitor.borrow().clone();
++            let generation = monitor.as_ref().map(PpsFileMonitor::generation);
+             if !self.check_document_modified_reload() {
+                 glib::spawn_future_local(glib::clone!(
+                     #[weak(rename_to = obj)]
+                     self,
+                     async move {
++                        // A save or a new document may have superseded this
++                        // notification before the queued future starts.
++                        if *obj.monitor.borrow() != monitor
++                            || monitor.as_ref().is_some_and(|monitor| {
++                                monitor.is_suspended() || Some(monitor.generation()) != generation
++                            })
++                        {
++                            return;
++                        }
+                         obj.reload_document().await;
+                     }
+                 ));
+@@ -1295,6 +1320,13 @@ impl PpsWindow {
+         self.imp().file.borrow().as_ref().map(|f| f.uri().into())
+     }
+ 
++    pub(crate) fn suspend_file_monitor(
++        &self,
++        file: &gio::File,
++    ) -> Option<crate::file_monitor::FileMonitorGuard> {
++        self.imp().suspend_file_monitor(file)
++    }
++
+     pub fn open(
+         &self,
+         file: &gio::File,
+@@ -1337,3 +1369,189 @@ impl Default for PpsWindow {
+         Self::new()
+     }
+ }
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++    use std::rc::Rc;
++    use std::time::{Duration, Instant};
++
++    fn pump_until(mut condition: impl FnMut() -> bool) {
++        let context = glib::MainContext::default();
++        let deadline = Instant::now() + Duration::from_secs(10);
++        while !condition() && Instant::now() < deadline {
++            while context.pending() {
++                context.iteration(false);
++            }
++            std::thread::sleep(Duration::from_millis(5));
++        }
++        assert!(condition(), "timed out waiting for the document operation");
++    }
++
++    fn pump_for(duration: Duration) {
++        let until = Instant::now() + duration;
++        pump_until(|| Instant::now() >= until);
++    }
++
++    fn make_pdf() -> Vec<u8> {
++        let mut objects = vec![
++            "<< /Type /Catalog /Pages 2 0 R >>".to_string(),
++            "<< /Type /Pages /Count 8 /Kids [3 0 R 4 0 R 5 0 R 6 0 R 7 0 R 8 0 R 9 0 R 10 0 R] >>"
++                .to_string(),
++        ];
++        for _ in 0..8 {
++            objects.push(
++                "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 600 800] /Resources << >> >>"
++                    .to_string(),
++            );
++        }
++        let mut pdf = "%PDF-1.4\n".to_string();
++        let mut offsets = Vec::new();
++        for (i, object) in objects.iter().enumerate() {
++            offsets.push(pdf.len());
++            pdf.push_str(&format!("{} 0 obj\n{}\nendobj\n", i + 1, object));
++        }
++        let xref = pdf.len();
++        pdf.push_str(&format!(
++            "xref\n0 {}\n0000000000 65535 f \n",
++            objects.len() + 1
++        ));
++        for offset in offsets {
++            pdf.push_str(&format!("{offset:010} 00000 n \n"));
++        }
++        pdf.push_str(&format!(
++            "trailer\n<< /Size {} /Root 1 0 R >>\nstartxref\n{xref}\n%%EOF\n",
++            objects.len() + 1
++        ));
++        pdf.into_bytes()
++    }
++
++    fn find_view(widget: &gtk::Widget) -> Option<papers_view::View> {
++        if let Ok(view) = widget.clone().downcast::<papers_view::View>() {
++            return Some(view);
++        }
++        let mut child = widget.first_child();
++        while let Some(widget) = child {
++            if let Some(view) = find_view(&widget) {
++                return Some(view);
++            }
++            child = widget.next_sibling();
++        }
++        None
++    }
++
++    #[test]
++    fn in_place_save_keeps_document_page_and_scroll_and_external_reload_still_works() {
++        gtk::init().unwrap();
++        let context = glib::MainContext::default();
++        let _context = context.acquire().unwrap();
++        let app = PpsApplication::new();
++        app.register(gio::Cancellable::NONE).unwrap();
++        let window = PpsWindow::new();
++        let path =
++            std::env::temp_dir().join(format!("papers-save-view-{}.pdf", std::process::id()));
++        std::fs::write(&path, make_pdf()).unwrap();
++        let file = gio::File::for_path(&path);
++        window.open(&file, None, None);
++        window.present();
++        pump_until(|| window.document().is_some());
++        pump_for(Duration::from_millis(500));
++
++        let document_view = window.imp().document_view.clone();
++        let model = document_view.model();
++        model.set_page(4);
++        pump_for(Duration::from_millis(500));
++        let view = find_view(document_view.upcast_ref::<gtk::Widget>()).unwrap();
++        let scroll = view.dynamic_cast::<gtk::Scrollable>().unwrap();
++        let vertical = scroll.vadjustment().unwrap();
++        vertical.set_value(vertical.value() + 120.0);
++        pump_for(Duration::from_secs(2));
++        let page = model.page();
++        let scroll = vertical.value();
++        let document = window.document().unwrap();
++        let reloads = Rc::new(Cell::new(0));
++        model.connect_document_notify(glib::clone!(
++            #[strong]
++            reloads,
++            move |_| reloads.set(reloads.get() + 1)
++        ));
++
++        for cycle in 0..3 {
++            // Also cancel a reload that was queued before this save began.
++            window
++                .imp()
++                .monitor
++                .borrow()
++                .as_ref()
++                .unwrap()
++                .emit_by_name::<()>("changed", &[]);
++            let annotation = papers_document::AnnotationText::new(&document.page(4).unwrap());
++            annotation.set_contents(&format!("save cycle {cycle}"));
++            document
++                .dynamic_cast_ref::<DocumentAnnotations>()
++                .unwrap()
++                .add_annotation(&annotation);
++            WidgetExt::activate_action(document_view.upcast_ref::<gtk::Widget>(), "doc.save", None)
++                .unwrap();
++            // A repeated Ctrl+S must not cancel the running save or its guard.
++            WidgetExt::activate_action(document_view.upcast_ref::<gtk::Widget>(), "doc.save", None)
++                .unwrap();
++            pump_until(|| {
++                !window
++                    .imp()
++                    .monitor
++                    .borrow()
++                    .as_ref()
++                    .unwrap()
++                    .is_suspended()
++            });
++            // Cover both immediate monitor events and the five-second fallback.
++            pump_for(Duration::from_secs(6));
++            assert_eq!(reloads.get(), 0, "own saves must not replace the document");
++            assert_eq!(window.document(), Some(document.clone()));
++            assert_eq!(model.page(), page);
++            assert!(
++                (vertical.value() - scroll).abs() < 0.01,
++                "save changed the scroll position from {scroll} to {} in cycle {cycle}",
++                vertical.value()
++            );
++            let saved = Document::factory_get_document(&file.uri()).unwrap();
++            saved.load(&file.uri()).unwrap();
++            assert_eq!(saved.n_pages(), 8);
++            let annotations = saved
++                .dynamic_cast_ref::<DocumentAnnotations>()
++                .unwrap()
++                .annotations(&saved.page(4).unwrap());
++            assert_eq!(annotations.len(), cycle + 1);
++        }
++
++        // A failed copy must release the guard too. Replacing the target with a
++        // directory forces JobSave to fail without changing any user document.
++        let backup = path.with_extension("backup.pdf");
++        std::fs::rename(&path, &backup).unwrap();
++        std::fs::create_dir(&path).unwrap();
++        WidgetExt::activate_action(document_view.upcast_ref::<gtk::Widget>(), "doc.save", None)
++            .unwrap();
++        pump_until(|| {
++            !window
++                .imp()
++                .monitor
++                .borrow()
++                .as_ref()
++                .unwrap()
++                .is_suspended()
++        });
++        assert!(path.is_dir(), "the save should have failed");
++        assert_eq!(window.document(), Some(document.clone()));
++        assert_eq!(reloads.get(), 0);
++        std::fs::remove_dir(&path).unwrap();
++        std::fs::rename(&backup, &path).unwrap();
++
++        // Copying a file over the PDF after saving is still an external update.
++        std::fs::write(&path, make_pdf()).unwrap();
++        pump_until(|| reloads.get() > 0);
++        window.destroy();
++        papers_view::Job::scheduler_wait();
++        std::fs::remove_file(path).unwrap();
++    }
++}

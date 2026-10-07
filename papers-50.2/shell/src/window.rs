@@ -180,6 +180,20 @@ mod imp {
             }
         }
 
+        pub(super) fn suspend_file_monitor(
+            &self,
+            file: &gio::File,
+        ) -> Option<crate::file_monitor::FileMonitorGuard> {
+            let monitor = self.monitor.borrow().clone()?;
+            if !gio::File::for_uri(&monitor.uri()).equal(file) {
+                return None;
+            }
+
+            let guard = monitor.suspend();
+            self.clear_reload_job();
+            Some(guard)
+        }
+
         fn set_mode(&self, mode: WindowRunMode) {
             if self.mode.get() == mode {
                 return;
@@ -768,11 +782,22 @@ mod imp {
         }
 
         fn file_changed(&self) {
+            let monitor = self.monitor.borrow().clone();
+            let generation = monitor.as_ref().map(PpsFileMonitor::generation);
             if !self.check_document_modified_reload() {
                 glib::spawn_future_local(glib::clone!(
                     #[weak(rename_to = obj)]
                     self,
                     async move {
+                        // A save or a new document may have superseded this
+                        // notification before the queued future starts.
+                        if *obj.monitor.borrow() != monitor
+                            || monitor.as_ref().is_some_and(|monitor| {
+                                monitor.is_suspended() || Some(monitor.generation()) != generation
+                            })
+                        {
+                            return;
+                        }
                         obj.reload_document().await;
                     }
                 ));
@@ -1295,6 +1320,13 @@ impl PpsWindow {
         self.imp().file.borrow().as_ref().map(|f| f.uri().into())
     }
 
+    pub(crate) fn suspend_file_monitor(
+        &self,
+        file: &gio::File,
+    ) -> Option<crate::file_monitor::FileMonitorGuard> {
+        self.imp().suspend_file_monitor(file)
+    }
+
     pub fn open(
         &self,
         file: &gio::File,
@@ -1335,5 +1367,191 @@ impl PpsWindow {
 impl Default for PpsWindow {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::rc::Rc;
+    use std::time::{Duration, Instant};
+
+    fn pump_until(mut condition: impl FnMut() -> bool) {
+        let context = glib::MainContext::default();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !condition() && Instant::now() < deadline {
+            while context.pending() {
+                context.iteration(false);
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(condition(), "timed out waiting for the document operation");
+    }
+
+    fn pump_for(duration: Duration) {
+        let until = Instant::now() + duration;
+        pump_until(|| Instant::now() >= until);
+    }
+
+    fn make_pdf() -> Vec<u8> {
+        let mut objects = vec![
+            "<< /Type /Catalog /Pages 2 0 R >>".to_string(),
+            "<< /Type /Pages /Count 8 /Kids [3 0 R 4 0 R 5 0 R 6 0 R 7 0 R 8 0 R 9 0 R 10 0 R] >>"
+                .to_string(),
+        ];
+        for _ in 0..8 {
+            objects.push(
+                "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 600 800] /Resources << >> >>"
+                    .to_string(),
+            );
+        }
+        let mut pdf = "%PDF-1.4\n".to_string();
+        let mut offsets = Vec::new();
+        for (i, object) in objects.iter().enumerate() {
+            offsets.push(pdf.len());
+            pdf.push_str(&format!("{} 0 obj\n{}\nendobj\n", i + 1, object));
+        }
+        let xref = pdf.len();
+        pdf.push_str(&format!(
+            "xref\n0 {}\n0000000000 65535 f \n",
+            objects.len() + 1
+        ));
+        for offset in offsets {
+            pdf.push_str(&format!("{offset:010} 00000 n \n"));
+        }
+        pdf.push_str(&format!(
+            "trailer\n<< /Size {} /Root 1 0 R >>\nstartxref\n{xref}\n%%EOF\n",
+            objects.len() + 1
+        ));
+        pdf.into_bytes()
+    }
+
+    fn find_view(widget: &gtk::Widget) -> Option<papers_view::View> {
+        if let Ok(view) = widget.clone().downcast::<papers_view::View>() {
+            return Some(view);
+        }
+        let mut child = widget.first_child();
+        while let Some(widget) = child {
+            if let Some(view) = find_view(&widget) {
+                return Some(view);
+            }
+            child = widget.next_sibling();
+        }
+        None
+    }
+
+    #[test]
+    fn in_place_save_keeps_document_page_and_scroll_and_external_reload_still_works() {
+        gtk::init().unwrap();
+        let context = glib::MainContext::default();
+        let _context = context.acquire().unwrap();
+        let app = PpsApplication::new();
+        app.register(gio::Cancellable::NONE).unwrap();
+        let window = PpsWindow::new();
+        let path =
+            std::env::temp_dir().join(format!("papers-save-view-{}.pdf", std::process::id()));
+        std::fs::write(&path, make_pdf()).unwrap();
+        let file = gio::File::for_path(&path);
+        window.open(&file, None, None);
+        window.present();
+        pump_until(|| window.document().is_some());
+        pump_for(Duration::from_millis(500));
+
+        let document_view = window.imp().document_view.clone();
+        let model = document_view.model();
+        model.set_page(4);
+        pump_for(Duration::from_millis(500));
+        let view = find_view(document_view.upcast_ref::<gtk::Widget>()).unwrap();
+        let scroll = view.dynamic_cast::<gtk::Scrollable>().unwrap();
+        let vertical = scroll.vadjustment().unwrap();
+        vertical.set_value(vertical.value() + 120.0);
+        pump_for(Duration::from_secs(2));
+        let page = model.page();
+        let scroll = vertical.value();
+        let document = window.document().unwrap();
+        let reloads = Rc::new(Cell::new(0));
+        model.connect_document_notify(glib::clone!(
+            #[strong]
+            reloads,
+            move |_| reloads.set(reloads.get() + 1)
+        ));
+
+        for cycle in 0..3 {
+            // Also cancel a reload that was queued before this save began.
+            window
+                .imp()
+                .monitor
+                .borrow()
+                .as_ref()
+                .unwrap()
+                .emit_by_name::<()>("changed", &[]);
+            let annotation = papers_document::AnnotationText::new(&document.page(4).unwrap());
+            annotation.set_contents(&format!("save cycle {cycle}"));
+            document
+                .dynamic_cast_ref::<DocumentAnnotations>()
+                .unwrap()
+                .add_annotation(&annotation);
+            WidgetExt::activate_action(document_view.upcast_ref::<gtk::Widget>(), "doc.save", None)
+                .unwrap();
+            // A repeated Ctrl+S must not cancel the running save or its guard.
+            WidgetExt::activate_action(document_view.upcast_ref::<gtk::Widget>(), "doc.save", None)
+                .unwrap();
+            pump_until(|| {
+                !window
+                    .imp()
+                    .monitor
+                    .borrow()
+                    .as_ref()
+                    .unwrap()
+                    .is_suspended()
+            });
+            // Cover both immediate monitor events and the five-second fallback.
+            pump_for(Duration::from_secs(6));
+            assert_eq!(reloads.get(), 0, "own saves must not replace the document");
+            assert_eq!(window.document(), Some(document.clone()));
+            assert_eq!(model.page(), page);
+            assert!(
+                (vertical.value() - scroll).abs() < 0.01,
+                "save changed the scroll position from {scroll} to {} in cycle {cycle}",
+                vertical.value()
+            );
+            let saved = Document::factory_get_document(&file.uri()).unwrap();
+            saved.load(&file.uri()).unwrap();
+            assert_eq!(saved.n_pages(), 8);
+            let annotations = saved
+                .dynamic_cast_ref::<DocumentAnnotations>()
+                .unwrap()
+                .annotations(&saved.page(4).unwrap());
+            assert_eq!(annotations.len(), cycle + 1);
+        }
+
+        // A failed copy must release the guard too. Replacing the target with a
+        // directory forces JobSave to fail without changing any user document.
+        let backup = path.with_extension("backup.pdf");
+        std::fs::rename(&path, &backup).unwrap();
+        std::fs::create_dir(&path).unwrap();
+        WidgetExt::activate_action(document_view.upcast_ref::<gtk::Widget>(), "doc.save", None)
+            .unwrap();
+        pump_until(|| {
+            !window
+                .imp()
+                .monitor
+                .borrow()
+                .as_ref()
+                .unwrap()
+                .is_suspended()
+        });
+        assert!(path.is_dir(), "the save should have failed");
+        assert_eq!(window.document(), Some(document.clone()));
+        assert_eq!(reloads.get(), 0);
+        std::fs::remove_dir(&path).unwrap();
+        std::fs::rename(&backup, &path).unwrap();
+
+        // Copying a file over the PDF after saving is still an external update.
+        std::fs::write(&path, make_pdf()).unwrap();
+        pump_until(|| reloads.get() > 0);
+        window.destroy();
+        papers_view::Job::scheduler_wait();
+        std::fs::remove_file(path).unwrap();
     }
 }

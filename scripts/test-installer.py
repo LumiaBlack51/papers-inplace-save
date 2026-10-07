@@ -3,12 +3,14 @@
 import json
 import os
 from pathlib import Path
+import re
 import subprocess
 import tempfile
 import unittest
 
 ROOT = Path(__file__).resolve().parents[1]
-COMMIT = '16573ca27c3e72932f9d7190c3686711c5d489d8c63f80658e6a74267e77e95e'
+COMMIT = re.search(r'^expected_commit=([0-9a-f]{64})$',
+                   (ROOT / 'packaging/papers-inplace-save').read_text(), re.M).group(1)
 
 class InstallerTests(unittest.TestCase):
     def setUp(self):

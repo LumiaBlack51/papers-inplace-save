@@ -358,6 +358,12 @@ impl imp::PpsDocumentView {
     }
 
     pub(super) fn save_in_place(&self) {
+        // Cancelling JobSave does not interrupt a write already running in the
+        // worker thread. Keep one save active, and its monitor guard alive.
+        if self.save_job.borrow().is_some() {
+            return;
+        }
+
         let Some(file) = self.file.borrow().clone() else {
             self.save_as();
             return;
@@ -368,11 +374,19 @@ impl imp::PpsDocumentView {
         let document = self.document().unwrap();
         let uri = file.uri();
         let save_job = papers_view::JobSave::new(&document, &uri, &uri);
+        let monitor_guard = self
+            .parent_window()
+            .downcast::<PpsWindow>()
+            .unwrap()
+            .suspend_file_monitor(&file);
 
         let id = save_job.connect_finished(glib::clone!(
             #[weak(rename_to = obj)]
             self,
             move |job| {
+                // Retain the guard through completion and error handling. It is
+                // released when clear_save_job disconnects this callback.
+                let _guard = &monitor_guard;
                 match job.is_succeeded() {
                     Err(e) => {
                         obj.error_message(
@@ -400,6 +414,10 @@ impl imp::PpsDocumentView {
     }
 
     pub(super) fn save_as(&self) {
+        if self.save_job.borrow().is_some() {
+            return;
+        }
+
         let dialog = gtk::FileDialog::builder()
             .title(gettext("Save As…"))
             .modal(true)
@@ -418,6 +436,10 @@ impl imp::PpsDocumentView {
                 match result {
                     Err(_) => obj.close_after_save.set(false),
                     Ok(file) => {
+                        if obj.save_job.borrow().is_some() {
+                            obj.close_after_save.set(false);
+                            return;
+                        }
                         obj.file_dialog_save_folder(Some(&file), UserDirectory::Documents);
 
                         obj.clear_save_job();
@@ -427,11 +449,17 @@ impl imp::PpsDocumentView {
                         let document_uri = obj.file.borrow().as_ref().unwrap().uri();
 
                         let save_job = papers_view::JobSave::new(&document, &uri, &document_uri);
+                        let monitor_guard = obj
+                            .parent_window()
+                            .downcast::<PpsWindow>()
+                            .unwrap()
+                            .suspend_file_monitor(&file);
 
                         let id = save_job.connect_finished(glib::clone!(
                             #[weak]
                             obj,
                             move |job| {
+                                let _guard = &monitor_guard;
                                 match job.is_succeeded() {
                                     Err(e) => {
                                         obj.close_after_save.set(false);

@@ -1,6 +1,6 @@
 # Papers: in-place save and annotation fixes
 
-Personal Linux build of GNOME Papers 50.2. Keeps **Ctrl+S saving to the current file** and fixes annotation deletion crashes and Chinese FreeText disappearing outside editing mode.
+Personal Linux build of GNOME Papers 50.2. Keeps **Ctrl+S saving to the current file without refreshing the reading view**, and fixes annotation deletion crashes and Chinese FreeText disappearing outside editing mode.
 
 This is an independent downstream project, not an official GNOME release. The deb is a **per-user Flatpak installer**, not a native build against Ubuntu's GTK libraries.
 
@@ -9,7 +9,7 @@ This is an independent downstream project, not an official GNOME release. The de
 Download the deb and SHA256SUMS from Releases, then:
 
 ```sh
-sudo apt install ./papers-inplace-save_50.2+fix20260922-1_amd64.deb
+sudo apt install ./papers-inplace-save_50.2+fix20261007-1_amd64.deb
 papers-inplace-save --install
 ```
 
@@ -30,6 +30,8 @@ The deb installs a launcher and payload only: it does not run a root Flatpak ins
 - Cancel deferred empty-text deletion when the widget is disposed; recheck contents and deletion state before executing.
 - When the selected font lacks a character and Pango finds a single fallback covering the whole text, use that font for the PDF annotation. Preserve point size and keep the original font when it covers the text. This also repairs font selection when an existing annotation enters editing mode.
 - Preserve the earlier Rust shell changes implementing Ctrl+S in-place saving.
+- Suspend file monitoring while saving over the open file, including Save As to the same target. Restore monitoring on completion or failure, and discard queued notifications from the old monitor. Ctrl+S retains the document, current page, and scroll position; subsequent external edits still reload normally.
+- Keep one save job active so repeated Ctrl+S cannot cancel a running write and restore monitoring too soon.
 
 No single fallback covering a mixed-script string means the existing font is retained. This does not solve every shaping, embedding, or cross-machine font issue.
 
@@ -37,14 +39,24 @@ No single fallback covering a mixed-script string means the existing font is ret
 
 `papers-50.2/` contains the full Papers source plus the patches. The upstream archive SHA-256 is `ae1bdcf1cd47cb50c9d84765784607f81c72df17dd6e6ad933fea14173d2b9f4` from `https://download.gnome.org/sources/papers/50/papers-50.2.tar.xz`. Patches are also available separately. GPL-2.0-or-later applies; retain upstream notices (see COPYING and source headers).
 
-The published Flatpak preserves the existing 50.2 shell and PDF backend, replacing only `libppsview`. The root Meson project rebuilds that library against the installed Flatpak and GNOME SDK 50, using checked-in generated resources from the original build:
+The September release replaced only `libppsview`. The October update rebuilds the Rust shell and retains those tested libraries and the PDF backend. The root Meson project rebuilds the library against the installed Flatpak and GNOME SDK 50, using checked-in generated resources from the original build:
 
 ```sh
 flatpak install flathub org.gnome.Sdk//50
 flatpak run --devel --filesystem="$PWD" --command=sh org.gnome.Papers//inplace-save -c "cd '$PWD' && meson setup build && ninja -C build && meson test -C build --print-errorlogs"
 ```
 
-`packaging/org.gnome.Papers.json` retains the original pinned dependency sources and adds the two patches. It can be used with `flatpak-builder --user --install --default-branch=inplace-save --force-clean staging packaging/org.gnome.Papers.json` for a full rebuild. **That full rebuild has not been executed for this release.** The shipped shell is byte-identical to the prior in-place-save installation. Runtime libraries are supplied by GNOME Platform 50.
+Build and test the updated shell against the installed `inplace-save` branch:
+
+```sh
+scripts/build-shell.sh test
+scripts/build-shell.sh build
+scripts/export-shell.sh
+```
+
+The scripts use GNOME SDK 50 and its Rust extension. Shell tests run on a separate Broadway display and private D-Bus session with in-memory settings; they do not touch existing windows or user PDFs. The export script copies the installed application, replaces only `papers`, exports a new Flatpak, updates the launcher's pinned commit, and builds the deb in `dist/`.
+
+`packaging/org.gnome.Papers.json` retains the original pinned dependency sources and adds the three patches. It can be used with `flatpak-builder --user --install --default-branch=inplace-save --force-clean staging packaging/org.gnome.Papers.json` for a full rebuild. **That full rebuild has not been executed for this release.** Runtime libraries are supplied by GNOME Platform 50.
 
 Build the deb from the release Flatpak:
 
@@ -59,3 +71,5 @@ The installer pins the shipped Flatpak commit. A new export requires updating `e
 Eight lifecycle checks pass. Against old source, six stale/deferred-removal cases fail and two normal-operation cases pass; all eight pass after the fix. Chinese editing/render/save/reopen fails with the old font behavior and passes after the fix. A separate test completes three in-place JobSave/reopen cycles, checks annotation counts, and rejects stale deletion. See [incident and validation record](doc/incident-20260922.md).
 
 Tests use disposable PDFs on ordinary local storage. Full GUI keystroke replay, every font/script, and OneDrive upload/download end-to-end have not been verified. No original user document is distributed.
+
+The shell regressions additionally exercise real file notifications, queued events, pending timeouts, repeated saves, and a live GTK reading view. See [save/refresh regression record](doc/save-refresh-20261007.md).

@@ -3677,6 +3677,10 @@
         {
           "type": "patch",
           "path": "../annotation-lifecycle-and-font.patch"
+        },
+        {
+          "type": "patch",
+          "path": "../save-without-reload.patch"
         }
       ],
       "post-install": [
