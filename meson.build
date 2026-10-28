@@ -3,6 +3,12 @@ cc = meson.get_compiler('c')
 incs = include_directories('papers-50.2', 'papers-50.2/libdocument', 'papers-50.2/libview', 'papers-50.2/libview/context', 'papers-50.2/libview/factory', 'generated', 'generated/libdocument', 'generated/libview')
 deps = [dependency('gtk4'), dependency('libadwaita-1'), dependency('gthread-2.0'), dependency('gmodule-2.0'), dependency('gtk4-unix-print'), cc.find_library('m'), cc.find_library('ppsdocument-4.0', dirs: '/app/lib')]
 args = ['-DHAVE_CONFIG_H', '-DPAPERS_COMPILATION', '-DI_KNOW_THE_PAPERS_LIBS_ARE_UNSTABLE_AND_HAVE_TALKED_WITH_THE_AUTHORS', '-DG_LOG_DOMAIN="PapersView"']
+# Match the installed PDF backend's upstream feature detection. The deployment
+# retains Poppler's library but omits its development headers/pkg-config file.
+poppler_glib = cc.find_library('poppler-glib', dirs: '/app/lib')
+if cc.has_function('poppler_page_render_transparent_selection', dependencies: poppler_glib, args: '-Wl,-rpath-link,/app/lib')
+  args += ['-DHAVE_TRANSPARENT_SELECTION']
+endif
 libview = both_libraries('ppsview-4.0',
   'papers-50.2/libview/context/pps-annotations-context.c',
   'papers-50.2/libview/context/pps-attachment-context.c',
@@ -48,3 +54,6 @@ test('save-reload', save_regression, args: [meson.current_source_dir() / 'papers
 
 render_test = executable('test-render-text', 'test-render-text.c', include_directories: incs, dependencies: deps + [dependency('cairo-pdf')], c_args: args, link_with: libview.get_static_lib())
 test('chinese-free-text-render-save', render_test)
+
+selection_test = executable('test-selection-render', 'test-selection-render.c', include_directories: incs, dependencies: deps + [dependency('cairo-pdf')], c_args: args, link_with: libview.get_static_lib())
+test('selection-render', selection_test)

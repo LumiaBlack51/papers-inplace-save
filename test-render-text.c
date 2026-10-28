@@ -72,11 +72,6 @@ int main(void) {
  g_assert_true(pps_document_load(reopened,uri,&error));g_assert_no_error(error);
  unsigned persisted=dark_pixels(reopened);
  g_print("han-after-save-reopen=%u\n",persisted);g_assert_cmpuint(persisted,>,0);
- PpsPage *rp=pps_document_get_page(reopened,0);
- PpsRenderContext *rc=pps_render_context_new(rp,0,1.,PPS_RENDER_ANNOTS_ALL);
- cairo_surface_t *image=pps_document_render(reopened,rc);
- cairo_surface_write_to_png(image,"chinese-save-check.png");
- cairo_surface_destroy(image);
  g_remove(path);g_rmdir(dir);
  return 0;
 }

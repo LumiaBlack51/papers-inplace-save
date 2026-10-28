@@ -21,6 +21,7 @@ get_accent_color (GdkRGBA *background_color, GdkRGBA *foreground_color)
 		foreground_color->red = 1.0;
 		foreground_color->green = 1.0;
 		foreground_color->blue = 1.0;
+		foreground_color->alpha = 1.0;
 	}
 }
 
