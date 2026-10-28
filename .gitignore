@@ -4,6 +4,8 @@
 /staging/
 /repo/
 /chinese-save-check.png
+/core
+/core.*
 *.flatpak
 *.deb
 __pycache__/

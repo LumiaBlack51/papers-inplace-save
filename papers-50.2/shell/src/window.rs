@@ -1440,6 +1440,64 @@ mod tests {
         None
     }
 
+    fn trigger_contains(trigger: &gtk::ShortcutTrigger, expected: &gtk::ShortcutTrigger) -> bool {
+        if let Some(alternative) = trigger.downcast_ref::<gtk::AlternativeTrigger>() {
+            trigger_contains(&alternative.first(), expected)
+                || trigger_contains(&alternative.second(), expected)
+        } else {
+            trigger.to_str() == expected.to_str()
+        }
+    }
+
+    fn find_shortcuts(
+        widget: &gtk::Widget,
+        trigger: &gtk::ShortcutTrigger,
+        found: &mut Vec<(gtk::Widget, gtk::Shortcut)>,
+    ) {
+        let controllers = widget.observe_controllers();
+        for i in 0..controllers.n_items() {
+            let Some(controller) = controllers
+                .item(i)
+                .and_downcast::<gtk::ShortcutController>()
+            else {
+                continue;
+            };
+            for j in 0..controller.n_items() {
+                let shortcut = controller.item(j).and_downcast::<gtk::Shortcut>().unwrap();
+                if shortcut.trigger().is_some_and(|t| trigger_contains(&t, trigger)) {
+                    found.push((widget.clone(), shortcut));
+                }
+            }
+        }
+        let mut child = widget.first_child();
+        while let Some(widget) = child {
+            find_shortcuts(&widget, trigger, found);
+            child = widget.next_sibling();
+        }
+    }
+
+    fn document_shortcut(widget: &gtk::Widget, accelerator: &str, action_name: &str) -> gtk::Shortcut {
+        let trigger = gtk::ShortcutTrigger::parse_string(accelerator).unwrap();
+        let mut found = Vec::new();
+        find_shortcuts(widget, &trigger, &mut found);
+        // GTK also creates signal shortcuts for the Save As menu button.
+        // Check the document's named shortcut, independent of those menu widgets.
+        found.retain(|(_, shortcut)| shortcut.action().is_some_and(|a| a.is::<gtk::NamedAction>()));
+        assert_eq!(found.len(), 1, "expected one binding for {accelerator}");
+        let (_, shortcut) = found.pop().unwrap();
+        let action = shortcut.action().and_downcast::<gtk::NamedAction>().unwrap();
+        assert_eq!(action.action_name(), action_name, "wrong action for {accelerator}");
+        shortcut
+    }
+
+    fn activate_shortcut(shortcut: &gtk::Shortcut, widget: &impl IsA<gtk::Widget>) {
+        assert!(shortcut.action().unwrap().activate(
+            gtk::ShortcutActionFlags::empty(),
+            widget,
+            shortcut.arguments().as_ref(),
+        ));
+    }
+
     #[test]
     fn in_place_save_keeps_document_page_and_scroll_and_external_reload_still_works() {
         gtk::init().unwrap();
@@ -1458,6 +1516,10 @@ mod tests {
         pump_for(Duration::from_millis(500));
 
         let document_view = window.imp().document_view.clone();
+        // Resolve the shortcuts loaded from the compiled UI resource. Calling
+        // doc.save directly would miss a Ctrl+S accidentally bound to save-as.
+        let save = document_shortcut(document_view.upcast_ref(), "<Ctrl>S", "doc.save");
+        document_shortcut(document_view.upcast_ref(), "<Ctrl><Shift>S", "doc.save-as");
         let model = document_view.model();
         model.set_page(4);
         pump_for(Duration::from_millis(500));
@@ -1491,11 +1553,9 @@ mod tests {
                 .dynamic_cast_ref::<DocumentAnnotations>()
                 .unwrap()
                 .add_annotation(&annotation);
-            WidgetExt::activate_action(document_view.upcast_ref::<gtk::Widget>(), "doc.save", None)
-                .unwrap();
+            activate_shortcut(&save, &document_view);
             // A repeated Ctrl+S must not cancel the running save or its guard.
-            WidgetExt::activate_action(document_view.upcast_ref::<gtk::Widget>(), "doc.save", None)
-                .unwrap();
+            activate_shortcut(&save, &document_view);
             pump_until(|| {
                 !window
                     .imp()
@@ -1530,8 +1590,7 @@ mod tests {
         let backup = path.with_extension("backup.pdf");
         std::fs::rename(&path, &backup).unwrap();
         std::fs::create_dir(&path).unwrap();
-        WidgetExt::activate_action(document_view.upcast_ref::<gtk::Widget>(), "doc.save", None)
-            .unwrap();
+        activate_shortcut(&save, &document_view);
         pump_until(|| {
             !window
                 .imp()

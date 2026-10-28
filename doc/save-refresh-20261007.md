@@ -79,3 +79,37 @@ their original executable until the user saves their work and reopens them.
 This validates the application save action and local GIO notifications. Full
 keyboard replay, real OneDrive round trips, simultaneous writes from another
 application during a save, and every filesystem/backend are not covered.
+
+## Ctrl+S binding correction, package revision 2
+
+The first October shell rebuild regenerated the UI resources from source. The
+source template still bound both Ctrl+S and Ctrl+Shift+S to `doc.save-as`;
+`preserved-inplace-save.patch` contained the save implementation but omitted the
+shortcut change from the previously installed application. As a result, pressing
+Ctrl+S opened Save As even though directly activating `doc.save` worked.
+
+Split the template bindings: Ctrl+S activates `doc.save`, and Ctrl+Shift+S
+activates `doc.save-as`. Update the shortcuts dialog to distinguish saving the
+current document from saving a copy. Include both resource changes in the
+preserved patch so subsequent builds retain them.
+
+The GTK regression now resolves the live named shortcuts from the compiled
+resource before activating the Ctrl+S shortcut action. It checks both mappings,
+saves and reopens three annotations in the original file, checks the page and
+scroll position, and exercises repeated saves, save errors, and later external
+reloads. GTK-generated menu-button signal shortcuts are excluded from the named
+document binding check. This is shortcut-controller activation, not hardware
+keyboard replay. The control run with the old template failed with
+`wrong action for <Ctrl>S`: actual `doc.save-as`, expected `doc.save`.
+
+The corrected deb version is `50.2+fix20261007-2`.
+
+All three shell regressions and five installer checks pass. The source patches
+apply cleanly and reproduce all seven affected shell files. The release and
+installed executables embed the tested resource bytes. The view library,
+document library, and PDF backend hashes match the previous deployment.
+
+The installed/exported revision-2 Flatpak commit is
+`dededc52a4a2206674e144aa5c72aa0da715bd8f6a50fe348fbbe58749573182`.
+Its executable SHA-256 is
+`95ed21bcf89f436c6ef3f39f7f85d0dc267df52ccd74fb35cb76050ac76db111`.

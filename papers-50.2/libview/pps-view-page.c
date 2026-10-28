@@ -602,6 +602,8 @@ pps_view_page_snapshot (GtkWidget *widget, GtkSnapshot *snapshot)
 			GdkRGBA color;
 
 			get_accent_color (&color, NULL);
+			/* Region-only backends do not redraw glyphs over the selection. */
+			color.alpha *= 0.3;
 			draw_selection_region (snapshot, region, &color);
 		}
 	}

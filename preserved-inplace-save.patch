@@ -96,3 +96,41 @@
          self.set_action_enabled("save-as", ok_to_copy);
          self.set_action_enabled("print", ok_to_print);
      }
+diff --git a/shell/resources/pps-document-view.blp b/shell/resources/pps-document-view.blp
+index 48430b1..9d4fa72 100644
+--- a/shell/resources/pps-document-view.blp
++++ b/shell/resources/pps-document-view.blp
+@@ -613,7 +613,12 @@ template $PpsDocumentView: Adw.BreakpointBin {
+       }
+ 
+       Shortcut {
+-        trigger: "<Ctrl>S|<Ctrl><Shift>S";
++        trigger: "<Ctrl>S";
++        action: "action(doc.save)";
++      }
++
++      Shortcut {
++        trigger: "<Ctrl><Shift>S";
+         action: "action(doc.save-as)";
+       }
+ 
+diff --git a/shell/resources/pps-shortcuts-dialog.blp b/shell/resources/pps-shortcuts-dialog.blp
+index 2f9ba38..ec63f4f 100644
+--- a/shell/resources/pps-shortcuts-dialog.blp
++++ b/shell/resources/pps-shortcuts-dialog.blp
+@@ -20,9 +20,14 @@ Adw.ShortcutsDialog shortcuts_dialog {
+       accelerator: "<Ctrl><Shift>O";
+     }
+ 
++    Adw.ShortcutsItem {
++      title: C_("shortcut window", "Save Current Document");
++      accelerator: "<Ctrl>S";
++    }
++
+     Adw.ShortcutsItem {
+       title: C_("shortcut window", "Save Copy of Current Document");
+-      accelerator: "<Ctrl>S <Ctrl><Shift>S";
++      accelerator: "<Ctrl><Shift>S";
+     }
+ 
+     Adw.ShortcutsItem {

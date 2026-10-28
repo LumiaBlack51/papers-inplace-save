@@ -3681,6 +3681,10 @@
         {
           "type": "patch",
           "path": "../save-without-reload.patch"
+        },
+        {
+          "type": "patch",
+          "path": "../selection-visibility.patch"
         }
       ],
       "post-install": [

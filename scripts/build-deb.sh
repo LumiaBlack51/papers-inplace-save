@@ -9,7 +9,7 @@ trap 'rm -rf -- "$stage"' EXIT
 install -d "$stage/DEBIAN" "$stage/usr/bin" "$stage/usr/share/papers-inplace-save" "$stage/usr/share/applications" "$stage/usr/share/doc/papers-inplace-save"
 cat > "$stage/DEBIAN/control" <<CONTROL
 Package: papers-inplace-save
-Version: 50.2+fix20261007-1
+Version: 50.2+fix20261028-1
 Architecture: amd64
 Maintainer: LumiaBlack51 <LumiaBlack51@users.noreply.github.com>
 Depends: flatpak (>= 1.14)
@@ -19,7 +19,8 @@ Homepage: https://github.com/LumiaBlack51/papers-inplace-save
 Description: Papers annotation fixes and in-place save (Flatpak installer)
  Bundles the fixed Papers Flatpak and a per-user installer/launcher.
  Preserves Ctrl+S in-place saving, fixes stale annotation removal and
- Chinese FreeText font fallback. Requires GNOME Platform 50; Flatpak
+ Chinese FreeText font fallback and selected-text visibility.
+ Requires GNOME Platform 50; Flatpak
  may download that runtime on first installation. In-place saving keeps
  the current page and scroll position without reloading the document.
  No root install hooks.
@@ -32,4 +33,4 @@ install -m 0644 "$root/doc/incident-20260922.md" "$stage/usr/share/doc/papers-in
 install -m 0644 "$root/doc/save-refresh-20261007.md" "$stage/usr/share/doc/papers-inplace-save/"
 chmod 0755 "$stage"
 mkdir -p "$root/dist"
-dpkg-deb --build --root-owner-group "$stage" "$root/dist/papers-inplace-save_50.2+fix20261007-1_amd64.deb"
+dpkg-deb --build --root-owner-group "$stage" "$root/dist/papers-inplace-save_50.2+fix20261028-1_amd64.deb"

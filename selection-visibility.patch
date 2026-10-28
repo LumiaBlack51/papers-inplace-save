@@ -1,0 +1,25 @@
+diff --git a/libview/pps-colors.c b/libview/pps-colors.c
+index 00b6477..fb6cdd8 100644
+--- a/libview/pps-colors.c
++++ b/libview/pps-colors.c
+@@ -21,6 +21,7 @@ get_accent_color (GdkRGBA *background_color, GdkRGBA *foreground_color)
+ 		foreground_color->red = 1.0;
+ 		foreground_color->green = 1.0;
+ 		foreground_color->blue = 1.0;
++		foreground_color->alpha = 1.0;
+ 	}
+ }
+ 
+diff --git a/libview/pps-view-page.c b/libview/pps-view-page.c
+index d8504ed..960efbd 100644
+--- a/libview/pps-view-page.c
++++ b/libview/pps-view-page.c
+@@ -602,6 +602,8 @@ pps_view_page_snapshot (GtkWidget *widget, GtkSnapshot *snapshot)
+ 			GdkRGBA color;
+ 
+ 			get_accent_color (&color, NULL);
++			/* Region-only backends do not redraw glyphs over the selection. */
++			color.alpha *= 0.3;
+ 			draw_selection_region (snapshot, region, &color);
+ 		}
+ 	}
