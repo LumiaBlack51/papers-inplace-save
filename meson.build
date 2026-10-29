@@ -57,3 +57,6 @@ test('chinese-free-text-render-save', render_test)
 
 selection_test = executable('test-selection-render', 'test-selection-render.c', include_directories: incs, dependencies: deps + [dependency('cairo-pdf')], c_args: args, link_with: libview.get_static_lib())
 test('selection-render', selection_test)
+
+popup_test = executable('test-annotation-popup', 'test-annotation-popup.c', include_directories: incs, dependencies: deps, c_args: args, link_with: libview.get_shared_lib())
+test('annotation-popup-close-save-reopen', popup_test, args: [meson.current_source_dir() / 'papers-50.2/test-data/utf16le-annot.pdf'])

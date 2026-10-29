@@ -309,8 +309,12 @@ pps_annotation_window_dispose (GObject *object)
 static gboolean
 pps_annotation_window_close_request (GtkWindow *window)
 {
-	pps_annotation_window_sync_contents (PPS_ANNOTATION_WINDOW (window));
-	((PpsAnnotationWindow *) window)->is_open = FALSE;
+	PpsAnnotationWindow *annot_window = PPS_ANNOTATION_WINDOW (window);
+
+	pps_annotation_window_sync_contents (annot_window);
+	annot_window->is_open = FALSE;
+	/* An explicit close must also survive saving and reopening the PDF. */
+	pps_annotation_markup_set_popup_is_open (PPS_ANNOTATION_MARKUP (annot_window->annotation), FALSE);
 
 	return GTK_WINDOW_CLASS (pps_annotation_window_parent_class)->close_request (window);
 }
