@@ -3689,6 +3689,10 @@
         {
           "type": "patch",
           "path": "../annotation-popup-state.patch"
+        },
+        {
+          "type": "patch",
+          "path": "../queue-in-place-save.patch"
         }
       ],
       "post-install": [

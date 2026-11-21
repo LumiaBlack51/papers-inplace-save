@@ -193,6 +193,7 @@ mod imp {
 
         // Job
         pub(super) save_job: RefCell<Option<papers_view::JobSave>>,
+        pub(super) pending_save_in_place: Cell<bool>,
         pub(super) save_job_handler: RefCell<Option<glib::SignalHandlerId>>,
     }
 
@@ -823,12 +824,8 @@ mod imp {
                     self,
                     move |_, response| {
                         match response {
-                            "yes" => {
-                                obj.close_after_save.set(true);
-                                obj.save_as();
-                            }
+                            "yes" => obj.save_as(true),
                             "no" => obj.parent_window().destroy(),
-                            "cancel" => obj.close_after_save.set(false),
                             _ => (),
                         };
                     }

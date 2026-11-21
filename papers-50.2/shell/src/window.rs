@@ -1395,16 +1395,20 @@ mod tests {
 
     fn make_pdf() -> Vec<u8> {
         let mut objects = vec![
-            "<< /Type /Catalog /Pages 2 0 R >>".to_string(),
+            "<< /Type /Catalog /Pages 2 0 R /AcroForm << /Fields [11 0 R] >> >>".to_string(),
             "<< /Type /Pages /Count 8 /Kids [3 0 R 4 0 R 5 0 R 6 0 R 7 0 R 8 0 R 9 0 R 10 0 R] >>"
                 .to_string(),
         ];
-        for _ in 0..8 {
-            objects.push(
-                "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 600 800] /Resources << >> >>"
-                    .to_string(),
-            );
+        for page in 0..8 {
+            let annots = if page == 0 { "/Annots [11 0 R]" } else { "" };
+            objects.push(format!(
+                "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 600 800] /Resources << >> {annots} >>"
+            ));
         }
+        objects.push(
+            "<< /Type /Annot /Subtype /Widget /FT /Tx /T (name) /Rect [10 10 90 30] /P 3 0 R >>"
+                .to_string(),
+        );
         let mut pdf = "%PDF-1.4\n".to_string();
         let mut offsets = Vec::new();
         for (i, object) in objects.iter().enumerate() {
@@ -1424,6 +1428,24 @@ mod tests {
             objects.len() + 1
         ));
         pdf.into_bytes()
+    }
+
+    fn text_field(
+        document: &Document,
+    ) -> (papers_document::DocumentForms, papers_document::FormField) {
+        let forms = document
+            .clone()
+            .dynamic_cast::<papers_document::DocumentForms>()
+            .unwrap();
+        let field = forms
+            .form_fields(&document.page(0).unwrap())
+            .unwrap()
+            .nth(0)
+            .unwrap()
+            .data()
+            .and_downcast::<papers_document::FormField>()
+            .unwrap();
+        (forms, field)
     }
 
     fn find_view(widget: &gtk::Widget) -> Option<papers_view::View> {
@@ -1537,6 +1559,30 @@ mod tests {
             reloads,
             move |_| reloads.set(reloads.get() + 1)
         ));
+
+        // Hold the main loop until Poppler has serialized First. The job's
+        // finished callback is still pending when the second shortcut fires.
+        let (forms, field) = text_field(&document);
+        forms.form_field_text_set_text(&field, "First");
+        let (serialized, ready) = std::sync::mpsc::channel();
+        let handler = document.connect_modified_notify(move |doc| {
+            if !doc.is_modified() {
+                serialized.send(()).unwrap();
+            }
+        });
+        activate_shortcut(&save, &document_view);
+        ready.recv_timeout(Duration::from_secs(10)).unwrap();
+        document.disconnect(handler);
+        forms.form_field_text_set_text(&field, "Second");
+        activate_shortcut(&save, &document_view);
+        pump_until(|| !window.imp().monitor.borrow().as_ref().unwrap().is_suspended());
+        let saved = Document::factory_get_document(&file.uri()).unwrap();
+        saved.load(&file.uri()).unwrap();
+        let (saved_forms, saved_field) = text_field(&saved);
+        assert_eq!(
+            saved_forms.form_field_text_get_text(&saved_field).as_deref(),
+            Some("Second")
+        );
 
         for cycle in 0..3 {
             // Also cancel a reload that was queued before this save began.

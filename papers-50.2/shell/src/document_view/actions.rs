@@ -989,7 +989,7 @@ impl imp::PpsDocumentView {
     }
 
     fn cmd_save_as(&self) {
-        self.save_as();
+        self.save_as(false);
     }
 
     fn cmd_save_image_as(&self) {
