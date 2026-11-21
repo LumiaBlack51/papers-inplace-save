@@ -29,15 +29,19 @@ impl imp::PpsDocumentView {
         self.message_area.replace(area);
     }
 
-    pub(super) fn clear_save_job(&self) {
-        if let Some(job) = self.save_job.take() {
-            if !job.is_finished() {
-                job.cancel();
-            }
+    fn finish_save_job(&self) {
+        if let (Some(job), Some(id)) = (self.save_job.take(), self.save_job_handler.take()) {
+            job.disconnect(id);
+        }
 
-            if let Some(id) = self.save_job_handler.take() {
-                job.disconnect(id);
-            }
+        if self.pending_save_in_place.replace(false) {
+            self.save_in_place();
+        } else if self.close_after_save.replace(false) {
+            glib::idle_add_local_once(glib::clone!(
+                #[weak(rename_to = obj)]
+                self,
+                move || obj.parent_window().destroy()
+            ));
         }
     }
 
@@ -243,6 +247,8 @@ impl imp::PpsDocumentView {
             return;
         }
 
+        self.pending_save_in_place.set(false);
+        self.close_after_save.set(false);
         self.model.set_document(document);
 
         self.set_message_area(None);
@@ -293,8 +299,10 @@ impl imp::PpsDocumentView {
         let id = document.connect_modified_notify(glib::clone!(
             #[weak(rename_to = obj)]
             self,
-            move |_| {
-                obj.document_modified();
+            move |document| {
+                if document.is_modified() {
+                    obj.document_modified();
+                }
             }
         ));
 
@@ -358,37 +366,40 @@ impl imp::PpsDocumentView {
     }
 
     pub(super) fn save_in_place(&self) {
-        // Cancelling JobSave does not interrupt a write already running in the
-        // worker thread. Keep one save active, and its monitor guard alive.
+        // Coalesce requests while the worker is writing. The next job takes
+        // its snapshot from the live document after the active job finishes.
         if self.save_job.borrow().is_some() {
+            self.pending_save_in_place.set(true);
             return;
         }
 
         let Some(file) = self.file.borrow().clone() else {
-            self.save_as();
+            self.save_as(false);
             return;
         };
 
-        self.clear_save_job();
+        self.start_save_job(&file, true);
+    }
 
+    fn start_save_job(&self, file: &gio::File, in_place: bool) {
         let document = self.document().unwrap();
-        let uri = file.uri();
-        let save_job = papers_view::JobSave::new(&document, &uri, &uri);
+        let document_uri = self.file.borrow().as_ref().unwrap().uri();
+        let save_job = papers_view::JobSave::new(&document, &file.uri(), &document_uri);
         let monitor_guard = self
             .parent_window()
             .downcast::<PpsWindow>()
             .unwrap()
-            .suspend_file_monitor(&file);
+            .suspend_file_monitor(file);
 
         let id = save_job.connect_finished(glib::clone!(
             #[weak(rename_to = obj)]
             self,
             move |job| {
-                // Retain the guard through completion and error handling. It is
-                // released when clear_save_job disconnects this callback.
+                // Keep the monitor suspended through the handoff to a queued save.
                 let _guard = &monitor_guard;
                 match job.is_succeeded() {
                     Err(e) => {
+                        obj.close_after_save.set(false);
                         obj.error_message(
                             Some(&e),
                             &formatx!(
@@ -398,13 +409,23 @@ impl imp::PpsDocumentView {
                             .expect("Wrong format in translated string"),
                         );
                     }
+                    Ok(_) if !in_place => {
+                        if let Some(uri) = job.uri() {
+                            gtk::RecentManager::default().add_item(&uri);
+                        }
+                    }
                     Ok(_) => {
-                        obj.modified.set(false);
-                        obj.update_title();
+                        if !obj.pending_save_in_place.get()
+                            && obj.document().as_ref() == Some(&document)
+                            && !document.is_modified()
+                        {
+                            obj.modified.set(false);
+                            obj.update_title();
+                        }
                     }
                 }
 
-                obj.clear_save_job();
+                obj.finish_save_job();
             }
         ));
 
@@ -413,7 +434,7 @@ impl imp::PpsDocumentView {
         save_job.scheduler_push_job(JobPriority::PriorityNone);
     }
 
-    pub(super) fn save_as(&self) {
+    pub(super) fn save_as(&self, close_after_save: bool) {
         if self.save_job.borrow().is_some() {
             return;
         }
@@ -433,72 +454,14 @@ impl imp::PpsDocumentView {
             async move {
                 let result = dialog.save_future(Some(&obj.parent_window())).await;
 
-                match result {
-                    Err(_) => obj.close_after_save.set(false),
-                    Ok(file) => {
-                        if obj.save_job.borrow().is_some() {
-                            obj.close_after_save.set(false);
-                            return;
-                        }
-                        obj.file_dialog_save_folder(Some(&file), UserDirectory::Documents);
-
-                        obj.clear_save_job();
-
-                        let document = obj.document().unwrap();
-                        let uri = file.uri();
-                        let document_uri = obj.file.borrow().as_ref().unwrap().uri();
-
-                        let save_job = papers_view::JobSave::new(&document, &uri, &document_uri);
-                        let monitor_guard = obj
-                            .parent_window()
-                            .downcast::<PpsWindow>()
-                            .unwrap()
-                            .suspend_file_monitor(&file);
-
-                        let id = save_job.connect_finished(glib::clone!(
-                            #[weak]
-                            obj,
-                            move |job| {
-                                let _guard = &monitor_guard;
-                                match job.is_succeeded() {
-                                    Err(e) => {
-                                        obj.close_after_save.set(false);
-                                        obj.error_message(
-                                            Some(&e),
-                                            &formatx!(
-                                                gettext("The file could not be saved as “{}”."),
-                                                job.uri().unwrap_or_default(),
-                                            )
-                                            .expect("Wrong format in translated string"),
-                                        );
-                                    }
-                                    Ok(_) => {
-                                        if let Some(uri) = job.uri() {
-                                            gtk::RecentManager::default().add_item(&uri);
-                                        }
-                                    }
-                                }
-
-                                obj.clear_save_job();
-
-                                if obj.close_after_save.get() {
-                                    glib::idle_add_local_once(glib::clone!(
-                                        #[weak]
-                                        obj,
-                                        move || {
-                                            obj.parent_window().destroy();
-                                        }
-                                    ));
-                                }
-                            }
-                        ));
-
-                        obj.save_job.replace(Some(save_job.clone()));
-                        obj.save_job_handler.replace(Some(id));
-
-                        // The priority doesn't matter for this job
-                        save_job.scheduler_push_job(JobPriority::PriorityNone);
+                if let Ok(file) = result {
+                    if obj.save_job.borrow().is_some() {
+                        return;
                     }
+                    obj.close_after_save.set(close_after_save);
+                    obj.file_dialog_save_folder(Some(&file), UserDirectory::Documents);
+
+                    obj.start_save_job(&file, false);
                 }
             }
         ));

@@ -34,7 +34,7 @@ The deb installs a launcher and payload only: it does not run a root Flatpak ins
 - Preserve the earlier Rust shell changes implementing Ctrl+S in-place saving.
 - Bind Ctrl+S to the in-place save action in the compiled UI; reserve Ctrl+Shift+S for Save As. Verify these bindings through the live GTK shortcut controllers during save regression checks.
 - Suspend file monitoring while saving over the open file, including Save As to the same target. Restore monitoring on completion or failure, and discard queued notifications from the old monitor. Ctrl+S retains the document, current page, and scroll position; subsequent external edits still reload normally.
-- Keep one save job active so repeated Ctrl+S cannot cancel a running write and restore monitoring too soon.
+- Keep one save job active. In the current source, Ctrl+S during a write queues one follow-up save of the latest edits. File monitoring resumes after both writes finish.
 
 No single fallback covering a mixed-script string means the existing font is retained. This does not solve every shaping, embedding, or cross-machine font issue.
 
@@ -59,7 +59,7 @@ scripts/export-flatpak.sh
 
 The scripts use GNOME SDK 50 and its Rust extension. GTK tests run on separate Broadway displays and private D-Bus sessions with in-memory settings; they do not touch existing windows or user PDFs. The export script copies the installed application, replaces `papers` and `libppsview`, exports a new Flatpak, updates the launcher's pinned commit, and builds the deb in `dist/`. For a library-only change on the matching installed shell, use `scripts/export-flatpak.sh --reuse-installed-shell` to retain that executable.
 
-`packaging/org.gnome.Papers.json` retains the original pinned dependency sources and adds the five patches. It can be used with `flatpak-builder --user --install --default-branch=inplace-save --force-clean staging packaging/org.gnome.Papers.json` for a full rebuild. **That full rebuild has not been executed for this release.** Runtime libraries are supplied by GNOME Platform 50.
+`packaging/org.gnome.Papers.json` retains the original pinned dependency sources and applies the downstream patches. It can be used with `flatpak-builder --user --install --default-branch=inplace-save --force-clean staging packaging/org.gnome.Papers.json` for a full rebuild. **That full rebuild has not been executed for this release.** Runtime libraries are supplied by GNOME Platform 50.
 
 Build the deb from the release Flatpak:
 
@@ -77,7 +77,9 @@ The selection regression generates a disposable PDF containing English and Chine
 
 Eight lifecycle checks pass. Against old source, six stale/deferred-removal cases fail and two normal-operation cases pass; all eight pass after the fix. Chinese editing/render/save/reopen fails with the old font behavior and passes after the fix. A separate test completes three in-place JobSave/reopen cycles, checks annotation counts, and rejects stale deletion. See [incident and validation record](doc/incident-20260922.md).
 
-Tests use disposable PDFs on ordinary local storage. Full GUI keystroke replay, every font/script, and OneDrive upload/download end-to-end have not been verified. No original user document is distributed.
+Tests use disposable PDFs on ordinary local storage. The shell regression changes a form field to `First`, starts a save, then changes it to `Second` and invokes Ctrl+S before the first completion callback runs. It checks the value by reopening the original path.
+
+A separate Xvfb keystroke test used a 72.6 MiB PDF and paused the first transfer after serialization to guarantee overlap. After exactly two Ctrl+S presses, an independent PDF reader saw `First` with the October 29 build and `Second` in both runs with the updated local Flatpak. The installed application also saved `Second` with the transfer running at normal speed. No original user document is distributed.
 
 The shell regressions additionally exercise real file notifications, queued events, pending timeouts, repeated saves, and a live GTK reading view. See [save/refresh regression record](doc/save-refresh-20261007.md).
 
