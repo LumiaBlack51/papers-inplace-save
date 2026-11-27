@@ -2,7 +2,7 @@
 Type=Application
 Name=Papers (in-place save fixes)
 Name[zh_CN]=Papers（原地保存修复版）
-Comment=Install or open Papers with annotation lifecycle and Chinese font fixes
+Comment=Install or open Papers with in-place saving and annotation fixes
 Exec=papers-inplace-save %U
 Icon=org.gnome.Papers
 Terminal=true

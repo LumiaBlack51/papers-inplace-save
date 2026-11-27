@@ -1,0 +1,2052 @@
+diff --git a/libview/meson.build b/libview/meson.build
+index 3124aef..e537a5e 100644
+--- a/libview/meson.build
++++ b/libview/meson.build
+@@ -159,7 +159,7 @@ resource_sources = gnome.compile_resources(
+ )
+ 
+ 
+-libppsview = shared_library(
++libppsview_pair = both_libraries(
+   'ppsview-' + pps_api_version,
+   version: pps_view_version,
+   sources: sources + resource_sources + marshal_sources + enum_sources,
+@@ -170,6 +170,8 @@ libppsview = shared_library(
+   gnu_symbol_visibility: 'hidden',
+ )
+ 
++libppsview = libppsview_pair.get_shared_lib()
++
+ libppsview_dep = declare_dependency(
+   sources: headers + [enum_sources[1]],
+   include_directories: libview_inc,
+diff --git a/libview/pps-form-overlay.c b/libview/pps-form-overlay.c
+index b84afe0..931c79d 100644
+--- a/libview/pps-form-overlay.c
++++ b/libview/pps-form-overlay.c
+@@ -152,7 +152,7 @@ pps_overlay_form_field_text_changed (GObject *widget,
+                                      PpsFormField *field)
+ {
+ 	PpsFormFieldText *field_text = PPS_FORM_FIELD_TEXT (field);
+-	gchar *text = NULL;
++	g_autofree gchar *text = NULL;
+ 
+ 	if (GTK_IS_ENTRY (widget)) {
+ 		text = g_strdup (gtk_editable_get_text (GTK_EDITABLE (widget)));
+@@ -164,10 +164,9 @@ pps_overlay_form_field_text_changed (GObject *widget,
+ 		                                 &start, &end, FALSE);
+ 	}
+ 
+-	if (!field_text->text ||
+-	    (field_text->text && g_ascii_strcasecmp (field_text->text, text) != 0)) {
++	if (g_strcmp0 (field_text->text, text) != 0) {
+ 		g_free (field_text->text);
+-		field_text->text = text;
++		field_text->text = g_steal_pointer (&text);
+ 		field->changed = TRUE;
+ 	}
+ }
+@@ -545,6 +544,16 @@ pps_overlay_form_field_choice_create_widget (PpsOverlayForm *view,
+ 
+ G_GNUC_END_IGNORE_DEPRECATIONS
+ 
++void
++pps_overlay_form_commit (PpsOverlayForm *form)
++{
++	PpsOverlayFormPrivate *priv = GET_PRIVATE (form);
++
++	/* Text fields normally commit only when the editor loses focus. */
++	if (PPS_IS_FORM_FIELD_TEXT (priv->field))
++		pps_overlay_form_field_text_save (form, NULL);
++}
++
+ static void
+ pps_overlay_form_dispose (GObject *object)
+ {
+diff --git a/libview/pps-form-overlay.h b/libview/pps-form-overlay.h
+index 7927558..b1f6af8 100644
+--- a/libview/pps-form-overlay.h
++++ b/libview/pps-form-overlay.h
+@@ -27,4 +27,6 @@ GtkWidget *pps_overlay_form_new (PpsFormField *field,
+                                  PpsPageCache *page_cache,
+                                  PpsPixbufCache *pixbuf_cache);
+ 
++void pps_overlay_form_commit (PpsOverlayForm *form);
++
+ G_END_DECLS
+diff --git a/libview/pps-jobs.c b/libview/pps-jobs.c
+index 13f87bd..1b92891 100644
+--- a/libview/pps-jobs.c
++++ b/libview/pps-jobs.c
+@@ -1128,6 +1128,7 @@ pps_job_save_run (PpsJob *job)
+ 	}
+ 
+ 	if (error) {
++		g_unlink (tmp_filename);
+ 		pps_job_failed_from_error (job, error);
+ 		return;
+ 	}
+@@ -1151,11 +1152,8 @@ pps_job_save_run (PpsJob *job)
+ 		uri_comp = pps_file_compress (tmp_uri, ctype, &error);
+ 		g_unlink (tmp_filename);
+ 
+-		if (!uri_comp || error) {
+-			tmp_uri = NULL;
+-		} else {
+-			tmp_uri = uri_comp;
+-		}
++		g_free (tmp_uri);
++		tmp_uri = uri_comp;
+ 	}
+ 
+ 	if (error) {
+diff --git a/libview/pps-view.c b/libview/pps-view.c
+index c0453dd..5195b2b 100644
+--- a/libview/pps-view.c
++++ b/libview/pps-view.c
+@@ -23,6 +23,7 @@
+ #include "pps-mapping-list.h"
+ 
+ #include "pps-overlay.h"
++#include "pps-form-overlay.h"
+ #include "pps-view-private.h"
+ #include "pps-view.h"
+ 
+@@ -2719,6 +2720,21 @@ pps_view_handle_annotation (PpsView *view,
+ 	}
+ }
+ 
++void
++pps_view_commit_form_edits (PpsView *view)
++{
++	GtkRoot *root = gtk_widget_get_root (GTK_WIDGET (view));
++	GtkWidget *focus = root ? gtk_root_get_focus (root) : NULL;
++	GtkWidget *form;
++
++	if (!focus || !gtk_widget_is_ancestor (focus, GTK_WIDGET (view)))
++		return;
++
++	form = gtk_widget_get_ancestor (focus, PPS_TYPE_OVERLAY_FORM);
++	if (form)
++		pps_overlay_form_commit (PPS_OVERLAY_FORM (form));
++}
++
+ void
+ pps_view_open_annotation_editor (PpsView *view,
+                                  PpsAnnotation *annot)
+diff --git a/libview/pps-view.h b/libview/pps-view.h
+index 467a713..02cf398 100644
+--- a/libview/pps-view.h
++++ b/libview/pps-view.h
+@@ -104,6 +104,10 @@ PpsDocumentPoint *pps_view_get_document_point_for_view_point (PpsView *view,
+                                                               gdouble view_point_x,
+                                                               gdouble view_point_y);
+ 
++/* Forms */
++PPS_PUBLIC
++void pps_view_commit_form_edits (PpsView *view);
++
+ /* Annotations */
+ PPS_PUBLIC
+ void pps_view_set_annotations_context (PpsView *view,
+diff --git a/libview/tests/downstream/meson.build b/libview/tests/downstream/meson.build
+new file mode 100644
+index 0000000..d2b51f1
+--- /dev/null
++++ b/libview/tests/downstream/meson.build
+@@ -0,0 +1,26 @@
++fixture = source_root / 'test-data/utf16le-annot.pdf'
++regression_env = environment()
++regression_env.set('PPS_BACKENDS_DIR', build_root / 'libdocument/backend')
++regression_env.set('PAPERS_TEST_PDF', fixture)
++
++cairo_pdf_dep = dependency('cairo-pdf')
++regressions = {
++  'annotation-lifecycle': [libppsview_pair.get_static_lib(), []],
++  'annotation-popup': [libppsview, [fixture]],
++  'render-text': [libppsview_pair.get_static_lib(), []],
++  'save-reload': [libppsview, [fixture]],
++  'selection-render': [libppsview_pair.get_static_lib(), []],
++}
++
++foreach name, options : regressions
++  regression = executable(
++    'test-' + name,
++    'test-' + name + '.c',
++    sources: [enum_sources[1]],
++    include_directories: [top_inc, libview_inc, context_inc, factory_inc],
++    dependencies: libview_deps + [cairo_pdf_dep],
++    link_with: options[0],
++    c_args: ['-DPAPERS_COMPILATION'],
++  )
++  test(name, regression, args: options[1], env: regression_env)
++endforeach
+diff --git a/libview/tests/downstream/test-annotation-lifecycle.c b/libview/tests/downstream/test-annotation-lifecycle.c
+new file mode 100644
+index 0000000..e12efd9
+--- /dev/null
++++ b/libview/tests/downstream/test-annotation-lifecycle.c
+@@ -0,0 +1,127 @@
++#include <papers-view.h>
++#include <papers-document.h>
++#include "pps-annotation-overlay.h"
++
++static const char *fixture;
++static gboolean loaded;
++static void on_loaded (PpsAnnotationsContext *ctx, gpointer data) { loaded = TRUE; }
++static void wait_loaded (void) {
++    gint64 deadline = g_get_monotonic_time () + 10 * G_TIME_SPAN_SECOND;
++    while (!loaded && g_get_monotonic_time () < deadline) {
++        while (g_main_context_iteration (NULL, FALSE));
++        g_usleep (1000);
++    }
++    g_assert_true (loaded);
++}
++static PpsDocument *load_doc (void) {
++    g_autofree char *uri = g_filename_to_uri (fixture, NULL, NULL);
++    GError *error = NULL;
++    PpsDocument *doc = pps_document_factory_get_document (uri, &error);
++    g_assert_no_error (error);
++    g_assert_nonnull (doc);
++    g_assert_true (pps_document_load (doc, uri, &error));
++    g_assert_no_error (error);
++    return g_object_ref_sink (doc);
++}
++static GtkWidget *find_text_view (GtkWidget *widget) {
++    if (GTK_IS_TEXT_VIEW (widget)) return widget;
++    for (GtkWidget *child = gtk_widget_get_first_child (widget); child; child = gtk_widget_get_next_sibling (child)) {
++        GtkWidget *result = find_text_view (child);
++        if (result) return result;
++    }
++    return NULL;
++}
++static void lifecycle (gconstpointer mode) {
++    PpsAnnotationModel *annotation_model = pps_annotation_model_new ();
++    PpsDocumentModel *model = g_object_new (PPS_TYPE_DOCUMENT_MODEL, "annotation-model", annotation_model, NULL);
++    PpsUndoContext *undo = pps_undo_context_new (model);
++    PpsAnnotationsContext *ctx = pps_annotations_context_new (model, undo);
++    PpsDocument *doc = load_doc ();
++    g_signal_connect (ctx, "annots-loaded", G_CALLBACK (on_loaded), NULL);
++    loaded = FALSE;
++    pps_document_model_set_document (model, doc);
++    wait_loaded ();
++    GListModel *annots = pps_annotations_context_get_annots_model (ctx);
++    guint initial = g_list_model_get_n_items (annots);
++    PpsPoint point = { 30, 30 };
++    GdkRGBA color = { 0, 0, 0, 1 };
++    PpsAnnotation *annot = g_object_ref (pps_annotations_context_add_annotation_sync (
++        ctx, 0, PPS_ANNOTATION_TYPE_FREE_TEXT, &point, &point, &color, NULL));
++    g_assert_cmpuint (g_list_model_get_n_items (annots), ==, initial + 1);
++    if (g_str_has_prefix (mode, "idle-")) {
++        GtkWidget *overlay = g_object_ref_sink (pps_overlay_annotation_entry_new (annot, ctx, model));
++        GtkWidget *text = find_text_view (overlay);
++        g_assert_nonnull (text);
++        GListModel *controllers = gtk_widget_observe_controllers (text);
++        gboolean emitted = FALSE;
++        for (guint i = 0; i < g_list_model_get_n_items (controllers); i++) {
++            GObject *controller = g_list_model_get_item (controllers, i);
++            if (GTK_IS_EVENT_CONTROLLER_FOCUS (controller)) {
++                g_signal_emit_by_name (controller, "leave");
++                g_signal_emit_by_name (controller, "leave");
++                emitted = TRUE;
++            }
++            g_object_unref (controller);
++        }
++        g_object_unref (controllers);
++        g_assert_true (emitted);
++        if (g_str_equal (mode, "idle-dispose")) {
++            g_object_unref (overlay);
++            overlay = NULL;
++        } else if (g_str_equal (mode, "idle-refilled")) {
++            gtk_text_buffer_set_text (gtk_text_view_get_buffer (GTK_TEXT_VIEW (text)), "keep this annotation", -1);
++        } else if (g_str_equal (mode, "idle-removed")) {
++            pps_annotations_context_remove_annotation (ctx, annot);
++        } else if (g_str_equal (mode, "idle-reload")) {
++            PpsDocument *replacement = load_doc ();
++            loaded = FALSE;
++            pps_document_model_set_document (model, replacement);
++            wait_loaded ();
++        }
++        while (g_main_context_iteration (NULL, FALSE));
++        guint expected = (g_str_equal (mode, "idle-dispose") || g_str_equal (mode, "idle-refilled")) ? initial + 1 : initial;
++        g_assert_cmpuint (g_list_model_get_n_items (annots), ==, expected);
++        if (overlay) g_object_unref (overlay);
++    } else if (g_str_equal (mode, "stale")) {
++        PpsDocument *replacement = load_doc ();
++        loaded = FALSE;
++        pps_document_model_set_document (model, replacement);
++        wait_loaded ();
++        guint count = g_list_model_get_n_items (annots);
++        gboolean modified = pps_document_get_modified (replacement);
++        pps_annotations_context_remove_annotation (ctx, annot);
++        g_assert_cmpuint (g_list_model_get_n_items (annots), ==, count);
++        g_assert_cmpint (pps_document_get_modified (replacement), ==, modified);
++        g_assert_null (pps_undo_context_get_last_action (undo));
++    } else {
++        pps_annotations_context_remove_annotation (ctx, annot);
++        g_assert_cmpuint (g_list_model_get_n_items (annots), ==, initial);
++        gpointer last = pps_undo_context_get_last_action (undo);
++        if (g_str_equal (mode, "duplicate")) {
++            pps_annotations_context_remove_annotation (ctx, annot);
++            g_assert_true (last == pps_undo_context_get_last_action (undo));
++        }
++        pps_undo_context_undo (undo);
++        g_assert_cmpuint (g_list_model_get_n_items (annots), ==, initial + 1);
++        pps_undo_context_redo (undo);
++        g_assert_cmpuint (g_list_model_get_n_items (annots), ==, initial);
++    }
++    g_object_unref (annot);
++    /* Model/context signal lifetime is outside these short-lived regression cases. */
++}
++int main (int argc, char **argv) {
++    fixture = g_getenv ("PAPERS_TEST_PDF");
++    g_assert_nonnull (fixture);
++    g_test_init (&argc, &argv, NULL);
++    gtk_init ();
++    g_assert_true (pps_init ());
++    g_test_add_data_func ("/annotations/normal-remove-undo-redo", "normal", lifecycle);
++    g_test_add_data_func ("/annotations/stale-after-reload", "stale", lifecycle);
++    g_test_add_data_func ("/annotations/duplicate-remove", "duplicate", lifecycle);
++    g_test_add_data_func ("/annotations/idle-empty", "idle-empty", lifecycle);
++    g_test_add_data_func ("/annotations/idle-dispose", "idle-dispose", lifecycle);
++    g_test_add_data_func ("/annotations/idle-refilled", "idle-refilled", lifecycle);
++    g_test_add_data_func ("/annotations/idle-removed", "idle-removed", lifecycle);
++    g_test_add_data_func ("/annotations/idle-reload", "idle-reload", lifecycle);
++    return g_test_run ();
++}
+diff --git a/libview/tests/downstream/test-annotation-popup.c b/libview/tests/downstream/test-annotation-popup.c
+new file mode 100644
+index 0000000..9625a76
+--- /dev/null
++++ b/libview/tests/downstream/test-annotation-popup.c
+@@ -0,0 +1,157 @@
++// SPDX-License-Identifier: GPL-2.0-or-later
++#include <adwaita.h>
++#include <glib/gstdio.h>
++#include <papers-document.h>
++#include <papers-view.h>
++
++static gboolean loaded;
++
++static void
++annots_loaded (PpsAnnotationsContext *context, gpointer data)
++{
++	(void) context;
++	(void) data;
++	loaded = TRUE;
++}
++
++static void
++wait_loaded (void)
++{
++	gint64 deadline = g_get_monotonic_time () + 10 * G_TIME_SPAN_SECOND;
++	while (!loaded && g_get_monotonic_time () < deadline) {
++		while (g_main_context_iteration (NULL, FALSE))
++			;
++		g_usleep (1000);
++	}
++	g_assert_true (loaded);
++}
++
++static PpsDocument *
++open_document (const char *uri)
++{
++	g_autoptr (GError) error = NULL;
++	PpsDocument *document = pps_document_factory_get_document (uri, &error);
++	g_assert_no_error (error);
++	g_assert_nonnull (document);
++	g_assert_true (pps_document_load (document, uri, &error));
++	g_assert_no_error (error);
++	return g_object_ref_sink (document);
++}
++
++static GtkWidget *
++open_popup (PpsAnnotation *annot, GtkWidget **parent)
++{
++	*parent = gtk_window_new ();
++	PpsView *view = pps_view_new ();
++	gtk_window_set_child (GTK_WINDOW (*parent), GTK_WIDGET (view));
++	pps_view_open_annotation_editor (view, annot);
++	/* Drain the deferred present before testing an explicit close. */
++	while (g_main_context_iteration (NULL, FALSE))
++		;
++	GtkWidget *popup = g_object_get_data (G_OBJECT (annot), "popup");
++	g_assert_nonnull (popup);
++	g_assert_true (gtk_widget_get_visible (popup));
++	return popup;
++}
++
++int
++main (int argc, char **argv)
++{
++	g_assert_true (argc == 2 || argc == 3);
++	const char *contents = argc == 3 ? argv[2] : "popup state regression";
++	g_assert_true (pps_init ());
++	adw_init ();
++	g_autoptr (GError) error = NULL;
++	g_autofree char *dir = g_dir_make_tmp ("papers-popup-XXXXXX", &error);
++	g_assert_no_error (error);
++	g_autofree char *path = g_build_filename (dir, "copy.pdf", NULL);
++	g_autoptr (GFile) source = g_file_new_for_path (argv[1]);
++	g_autoptr (GFile) copy = g_file_new_for_path (path);
++	g_assert_true (g_file_copy (source, copy, G_FILE_COPY_NONE, NULL, NULL, NULL, &error));
++	g_assert_no_error (error);
++	g_autofree char *uri = g_file_get_uri (copy);
++	g_autoptr (PpsDocument) document = open_document (uri);
++	PpsAnnotationModel *annotation_model = pps_annotation_model_new ();
++	PpsDocumentModel *model = g_object_new (PPS_TYPE_DOCUMENT_MODEL,
++	                                      "annotation-model", annotation_model, NULL);
++	PpsUndoContext *undo = pps_undo_context_new (model);
++	PpsAnnotationsContext *context = pps_annotations_context_new (model, undo);
++	g_signal_connect (context, "annots-loaded", G_CALLBACK (annots_loaded), NULL);
++	pps_document_model_set_document (model, document);
++	wait_loaded ();
++	GListModel *annots = pps_annotations_context_get_annots_model (context);
++	guint initial_count = g_list_model_get_n_items (annots);
++	g_autoptr (PpsAnnotation) annot = NULL;
++	if (argc == 3) {
++		for (guint i = 0; i < initial_count; i++) {
++			g_autoptr (PpsAnnotation) candidate = g_list_model_get_item (annots, i);
++			if (g_strcmp0 (pps_annotation_get_contents (candidate), contents) == 0) {
++				annot = g_object_ref (candidate);
++				break;
++			}
++		}
++	} else {
++		PpsPoint point = { 40, 40 };
++		GdkRGBA color = { 1, 1, 0, 1 };
++		annot = g_object_ref (pps_annotations_context_add_annotation_sync (
++		    context, 0, PPS_ANNOTATION_TYPE_TEXT, &point, &point, &color, NULL));
++		pps_annotation_set_contents (annot, contents);
++		PpsRectangle rectangle = { 50, 50, 250, 200 };
++		g_object_set (annot, "has-popup", TRUE, "rectangle", &rectangle, NULL);
++	}
++	g_assert_nonnull (annot);
++	PpsAnnotationMarkup *markup = PPS_ANNOTATION_MARKUP (annot);
++	pps_annotation_markup_set_popup_is_open (markup, TRUE);
++
++	GtkWidget *parent;
++	GtkWidget *popup = open_popup (annot, &parent);
++
++	/* Scrolling the page away only hides the window temporarily. */
++	pps_document_set_modified (document, FALSE);
++	gtk_widget_set_visible (popup, FALSE);
++	g_assert_true (pps_annotation_markup_get_popup_is_open (markup));
++	g_assert_false (pps_document_get_modified (document));
++	gtk_widget_set_visible (popup, TRUE);
++
++	/* The explicit close request must update the PDF state as well. */
++	gtk_window_close (GTK_WINDOW (popup));
++	g_assert_false (gtk_widget_get_visible (popup));
++	g_assert_false (pps_annotation_markup_get_popup_is_open (markup));
++	g_assert_true (pps_document_get_modified (document));
++	g_assert_cmpstr (pps_annotation_get_contents (annot), ==, contents);
++
++	g_autoptr (PpsJob) save = pps_job_save_new (document, uri, uri);
++	pps_job_run (save);
++	g_assert_true (pps_job_is_succeeded (save, &error));
++	g_assert_no_error (error);
++	gtk_window_destroy (GTK_WINDOW (popup));
++	gtk_window_destroy (GTK_WINDOW (parent));
++
++	/* Reopening must preserve the note and its closed popup. */
++	g_autoptr (PpsDocument) reopened = open_document (uri);
++	loaded = FALSE;
++	pps_document_model_set_document (model, reopened);
++	wait_loaded ();
++	g_assert_cmpuint (g_list_model_get_n_items (annots), ==, initial_count + (argc == 2));
++	gboolean found = FALSE;
++	for (guint i = 0; i < g_list_model_get_n_items (annots); i++) {
++		g_autoptr (PpsAnnotation) saved = g_list_model_get_item (annots, i);
++		if (g_strcmp0 (pps_annotation_get_contents (saved), contents) != 0)
++			continue;
++		found = TRUE;
++		g_assert_false (pps_annotation_markup_get_popup_is_open (PPS_ANNOTATION_MARKUP (saved)));
++		/* The saved note can still be explicitly opened and closed again. */
++		popup = open_popup (saved, &parent);
++		g_assert_true (pps_annotation_markup_get_popup_is_open (PPS_ANNOTATION_MARKUP (saved)));
++		gtk_window_close (GTK_WINDOW (popup));
++		g_assert_false (gtk_widget_get_visible (popup));
++		g_assert_false (pps_annotation_markup_get_popup_is_open (PPS_ANNOTATION_MARKUP (saved)));
++		gtk_window_destroy (GTK_WINDOW (popup));
++		gtk_window_destroy (GTK_WINDOW (parent));
++	}
++	g_assert_true (found);
++	g_assert_cmpint (g_remove (path), ==, 0);
++	g_assert_cmpint (g_rmdir (dir), ==, 0);
++	g_print ("PASS: temporary hide preserves open state; explicit close survives save/reopen with note contents intact\n");
++	return 0;
++}
+diff --git a/libview/tests/downstream/test-render-text.c b/libview/tests/downstream/test-render-text.c
+new file mode 100644
+index 0000000..cc299ab
+--- /dev/null
++++ b/libview/tests/downstream/test-render-text.c
+@@ -0,0 +1,77 @@
++#include <papers-view.h>
++#include <papers-document.h>
++#include "pps-annotation-overlay.h"
++#include <cairo-pdf.h>
++#include <glib/gstdio.h>
++static GtkWidget *find_text (GtkWidget *w) {
++ if(GTK_IS_TEXT_VIEW(w)) return w;
++ for(GtkWidget *c=gtk_widget_get_first_child(w);c;c=gtk_widget_get_next_sibling(c)) {
++  GtkWidget *r=find_text(c); if(r) return r;
++ }
++ return NULL;
++}
++static unsigned dark_pixels (PpsDocument *doc) {
++ PpsPage *page = pps_document_get_page (doc,0);
++ PpsRenderContext *rc = pps_render_context_new (page,0,1.,PPS_RENDER_ANNOTS_ALL);
++ cairo_surface_t *s = pps_document_render (doc,rc);
++ cairo_surface_flush(s);
++ unsigned count=0;
++ unsigned char *bytes=cairo_image_surface_get_data(s);
++ int stride=cairo_image_surface_get_stride(s);
++ for(int y=0;y<200;y++) for(int x=0;x<300;x++) {
++  unsigned char *p=bytes+y*stride+4*x;
++  if(p[0]<240 || p[1]<240 || p[2]<240) count++;
++ }
++ cairo_surface_destroy(s); g_object_unref(rc); g_object_unref(page);
++ return count;
++}
++int main(void) {
++ pps_init();gtk_init();
++ GError *error=NULL;
++ char *dir=g_dir_make_tmp("papers-render-test-XXXXXX",&error);
++ char *path=g_build_filename(dir,"blank.pdf",NULL);
++ cairo_surface_t *s=cairo_pdf_surface_create(path,300,200);
++ cairo_t *cr=cairo_create(s); cairo_show_page(cr); cairo_destroy(cr); cairo_surface_destroy(s);
++ char *uri=g_filename_to_uri(path,NULL,NULL);
++ PpsDocument *doc=pps_document_factory_get_document(uri,&error);g_assert_no_error(error);
++ g_assert_true(pps_document_load(doc,uri,&error));g_assert_no_error(error);
++ PpsPage *page=pps_document_get_page(doc,0);
++ PpsAnnotation *a=pps_annotation_free_text_new(page);
++ PpsRectangle rect={30,30,230,100};
++ GdkRGBA black={0,0,0,1},transparent={0,0,0,0};
++ pps_annotation_set_area(a,&rect);pps_annotation_set_rgba(a,&transparent);
++ pps_annotation_free_text_set_font_rgba(PPS_ANNOTATION_FREE_TEXT(a),&black);
++ PangoFontDescription *font=pango_font_description_from_string("Liberation Sans 18");
++ pps_annotation_free_text_set_font_description(PPS_ANNOTATION_FREE_TEXT(a),font);
++ pps_annotation_set_contents(a,"");
++ pps_document_annotations_add_annotation(PPS_DOCUMENT_ANNOTATIONS(doc),a);
++ g_print("blank=%u\n",dark_pixels(doc));
++ pps_annotation_set_contents(a,"Hello"); g_print("latin=%u\n",dark_pixels(doc));
++ pps_annotation_set_contents(a,"中文测试"); g_print("han-liberation=%u\n",dark_pixels(doc));
++ PpsAnnotationModel *am=pps_annotation_model_new();
++ PpsDocumentModel *model=g_object_new(PPS_TYPE_DOCUMENT_MODEL,"annotation-model",am,"document",doc,NULL);
++ PpsUndoContext *undo=pps_undo_context_new(model);
++ PpsAnnotationsContext *ctx=pps_annotations_context_new(model,undo);
++ GtkWidget *overlay=g_object_ref_sink(pps_overlay_annotation_entry_new(a,ctx,model));
++ unsigned visible=dark_pixels(doc);
++ g_print("han-after-editor-font-fallback=%u\n",visible);g_assert_cmpuint(visible,>,0);
++ PangoFontDescription *actual=pps_annotation_free_text_get_font_description(PPS_ANNOTATION_FREE_TEXT(a));
++ g_assert_cmpint(pango_font_description_get_size(actual),==,18*PANGO_SCALE);
++ GtkTextBuffer *buffer=gtk_text_view_get_buffer(GTK_TEXT_VIEW(find_text(overlay)));
++ gtk_text_buffer_set_text(buffer,"",-1);
++ pps_annotation_free_text_set_font_description(PPS_ANNOTATION_FREE_TEXT(a),font);
++ gtk_text_buffer_set_text(buffer,"Hello",-1);
++ g_assert_cmpuint(dark_pixels(doc),>,0);
++ PangoFontDescription *latin=pps_annotation_free_text_get_font_description(PPS_ANNOTATION_FREE_TEXT(a));
++ g_assert_cmpstr(pango_font_description_get_family(latin),==,"Liberation Sans");
++ gtk_text_buffer_set_text(buffer,"中文测试",-1);
++ g_assert_cmpuint(dark_pixels(doc),>,0);
++ PpsJob *job=pps_job_save_new(doc,uri,uri);pps_job_run(job);
++ g_assert_true(pps_job_is_succeeded(job,&error));g_assert_no_error(error);
++ PpsDocument *reopened=pps_document_factory_get_document(uri,&error);g_assert_no_error(error);
++ g_assert_true(pps_document_load(reopened,uri,&error));g_assert_no_error(error);
++ unsigned persisted=dark_pixels(reopened);
++ g_print("han-after-save-reopen=%u\n",persisted);g_assert_cmpuint(persisted,>,0);
++ g_remove(path);g_rmdir(dir);
++ return 0;
++}
+diff --git a/libview/tests/downstream/test-save-reload.c b/libview/tests/downstream/test-save-reload.c
+new file mode 100644
+index 0000000..7889713
+--- /dev/null
++++ b/libview/tests/downstream/test-save-reload.c
+@@ -0,0 +1,74 @@
++#include <papers-view.h>
++#include <papers-document.h>
++static gboolean loaded;
++static void on_loaded (PpsAnnotationsContext *ctx, gpointer data) { loaded = TRUE; }
++static void wait_loaded (void) {
++    gint64 deadline = g_get_monotonic_time () + 10 * G_TIME_SPAN_SECOND;
++    while (!loaded && g_get_monotonic_time () < deadline) {
++        while (g_main_context_iteration (NULL, FALSE));
++        g_usleep (1000);
++    }
++    g_assert_true (loaded);
++}
++static PpsDocument *open_doc (const char *uri) {
++    GError *error = NULL;
++    PpsDocument *doc = pps_document_factory_get_document (uri, &error);
++    g_assert_no_error (error);
++    g_assert_nonnull (doc);
++    g_assert_true (pps_document_load (doc, uri, &error));
++    g_assert_no_error (error);
++    return g_object_ref_sink (doc);
++}
++int main (int argc, char **argv) {
++    g_assert_cmpint (argc, ==, 2);
++    g_assert_true (pps_init ());
++    GError *error = NULL;
++    g_autofree char *dir = g_dir_make_tmp ("papers-save-regression-XXXXXX", &error);
++    g_assert_no_error (error);
++    g_autofree char *path = g_build_filename (dir, "copy.pdf", NULL);
++    g_autoptr (GFile) source = g_file_new_for_path (argv[1]);
++    g_autoptr (GFile) copy = g_file_new_for_path (path);
++    g_assert_true (g_file_copy (source, copy, G_FILE_COPY_NONE, NULL, NULL, NULL, &error));
++    g_assert_no_error (error);
++    g_autofree char *uri = g_file_get_uri (copy);
++    PpsAnnotationModel *annotation_model = pps_annotation_model_new ();
++    PpsDocumentModel *model = g_object_new (PPS_TYPE_DOCUMENT_MODEL, "annotation-model", annotation_model, NULL);
++    PpsUndoContext *undo = pps_undo_context_new (model);
++    PpsAnnotationsContext *ctx = pps_annotations_context_new (model, undo);
++    g_signal_connect (ctx, "annots-loaded", G_CALLBACK (on_loaded), NULL);
++    PpsDocument *doc = open_doc (uri);
++    pps_document_model_set_document (model, doc);
++    wait_loaded ();
++    GListModel *annots = pps_annotations_context_get_annots_model (ctx);
++    guint count = g_list_model_get_n_items (annots);
++    for (int cycle = 1; cycle <= 3; cycle++) {
++        PpsPoint p = { 40, 40 + cycle * 25 };
++        GdkRGBA color = { 0, 0, 0, 1 };
++        PpsAnnotation *a = g_object_ref (pps_annotations_context_add_annotation_sync (ctx, 0, PPS_ANNOTATION_TYPE_FREE_TEXT, &p, &p, &color, NULL));
++        pps_annotation_set_contents (a, "save regression");
++        PpsJob *job = pps_job_save_new (doc, uri, uri);
++        pps_job_run (job);
++        g_assert_true (pps_job_is_succeeded (job, &error));
++        g_assert_no_error (error);
++        PpsDocument *next = open_doc (uri);
++        loaded = FALSE;
++        pps_document_model_set_document (model, next);
++        wait_loaded ();
++        g_assert_cmpuint (g_list_model_get_n_items (annots), ==, count + cycle);
++        /* A delayed old-widget removal must not alter the reloaded document. */
++        pps_annotations_context_remove_annotation (ctx, a);
++        g_assert_false (pps_document_get_modified (next));
++        g_assert_cmpuint (g_list_model_get_n_items (annots), ==, count + cycle);
++        g_object_unref (a);
++        g_object_unref (doc);
++        doc = next;
++        g_object_unref (job);
++    }
++    g_assert_true (g_file_delete (copy, NULL, &error));
++    g_assert_no_error (error);
++    g_autoptr (GFile) directory = g_file_new_for_path (dir);
++    g_assert_true (g_file_delete (directory, NULL, &error));
++    g_assert_no_error (error);
++    g_print ("PASS: three in-place JobSave/reopen cycles; annotation counts and stale-removal protection verified\n");
++    return 0;
++}
+diff --git a/libview/tests/downstream/test-selection-render.c b/libview/tests/downstream/test-selection-render.c
+new file mode 100644
+index 0000000..cdb17ff
+--- /dev/null
++++ b/libview/tests/downstream/test-selection-render.c
+@@ -0,0 +1,125 @@
++// SPDX-License-Identifier: GPL-2.0-or-later
++#include <adwaita.h>
++#include <cairo-pdf.h>
++#include <glib/gstdio.h>
++#include "pps-pixbuf-cache.h"
++#include "pps-view-private.h"
++
++static gboolean page_ready;
++
++static void
++page_finished (PpsPixbufCache *cache, gint page, gpointer data)
++{
++	page_ready = TRUE;
++}
++
++static void
++wait_for_page (PpsPixbufCache *cache)
++{
++	gint64 deadline = g_get_monotonic_time () + 10 * G_TIME_SPAN_SECOND;
++	while (!page_ready && g_get_monotonic_time () < deadline) {
++		while (g_main_context_iteration (NULL, FALSE))
++			;
++		g_usleep (1000);
++	}
++	g_assert_true (page_ready);
++	g_assert_nonnull (pps_pixbuf_cache_get_texture (cache, 0));
++}
++
++static void
++check_selection (PpsPixbufCache *cache, double scale, const char *label)
++{
++	GdkTexture *selection = pps_pixbuf_cache_get_selection_texture (cache, 0, scale);
++	g_assert_nonnull (selection);
++	int width = gdk_texture_get_width (selection);
++	int height = gdk_texture_get_height (selection);
++	g_autofree guchar *pixels = g_malloc (width * height * 4);
++	gdk_texture_download (selection, pixels, width * 4);
++	guint selected = 0, max_alpha = 0;
++	for (int i = 0; i < width * height; i++) {
++		guint alpha = pixels[i * 4 + 3];
++		selected += alpha > 0;
++		max_alpha = MAX (max_alpha, alpha);
++	}
++	g_print ("%s: %u selected pixels, maximum alpha %u/255\n", label, selected, max_alpha);
++	g_assert_cmpuint (selected, >, 100);
++	/* Both focused (30%) and unfocused (10%) overlays must preserve the page. */
++	g_assert_cmpuint (max_alpha, >, 0);
++	g_assert_cmpuint (max_alpha, <=, 80);
++}
++
++int
++main (void)
++{
++	g_assert_true (pps_init ());
++	adw_init ();
++	g_autoptr (GError) error = NULL;
++	g_autofree char *dir = g_dir_make_tmp ("papers-selection-XXXXXX", &error);
++	g_assert_no_error (error);
++	g_autofree char *path = g_build_filename (dir, "selection.pdf", NULL);
++	g_autofree char *uri = g_filename_to_uri (path, NULL, NULL);
++	cairo_surface_t *pdf = cairo_pdf_surface_create (path, 400, 200);
++	cairo_t *cr = cairo_create (pdf);
++	PangoLayout *layout = pango_cairo_create_layout (cr);
++	PangoFontDescription *font = pango_font_description_from_string ("Sans 20");
++	pango_layout_set_font_description (layout, font);
++	pango_layout_set_text (layout, "Selection stays readable\n中文选区保持清晰", -1);
++	cairo_move_to (cr, 20, 30);
++	pango_cairo_show_layout (cr, layout);
++	g_object_unref (layout);
++	pango_font_description_free (font);
++	cairo_destroy (cr);
++	cairo_surface_destroy (pdf);
++
++	g_autoptr (PpsDocument) doc = pps_document_factory_get_document (uri, &error);
++	g_assert_no_error (error);
++	g_assert_true (pps_document_load (doc, uri, &error));
++	g_assert_no_error (error);
++	pps_document_setup_cache (doc);
++	g_autoptr (PpsAnnotationModel) annots = pps_annotation_model_new ();
++	g_autoptr (PpsDocumentModel) model = g_object_new (PPS_TYPE_DOCUMENT_MODEL,
++	                                                "annotation-model", annots,
++	                                                "document", doc, "scale", 1.0, NULL);
++	GtkWidget *window = gtk_window_new ();
++	GtkWidget *view = gtk_drawing_area_new ();
++	gtk_widget_set_focusable (view, TRUE);
++	gtk_window_set_child (GTK_WINDOW (window), view);
++	gtk_window_present (GTK_WINDOW (window));
++	gtk_widget_grab_focus (view);
++	g_autoptr (GObject) cache_object = G_OBJECT (pps_pixbuf_cache_new (view, model, 4 * 1024 * 1024));
++	PpsPixbufCache *cache = PPS_PIXBUF_CACHE (cache_object);
++	g_signal_connect (cache, "job-finished", G_CALLBACK (page_finished), NULL);
++	PpsViewSelection selected = { .page = 0, .style = PPS_SELECTION_STYLE_GLYPH,
++	                              .rect = { 0, 0, 400, 200 } };
++	GList list = { .data = &selected };
++
++	/* Selection present when the background render job starts. */
++	pps_pixbuf_cache_set_page_range (cache, 0, 0, &list);
++	wait_for_page (cache);
++	check_selection (cache, 1.0, "background render");
++	g_autoptr (PpsPage) page = pps_document_get_page (doc, 0);
++	g_autofree char *text = pps_selection_get_selected_text (PPS_SELECTION (doc), page,
++	                                                       PPS_SELECTION_STYLE_GLYPH, &selected.rect);
++	g_assert_nonnull (strstr (text, "Selection stays readable"));
++	g_assert_nonnull (strstr (text, "中文选区保持清晰"));
++
++	/* Drag updates use the synchronous path, then zoom triggers another job. */
++	selected.rect.y2 = 65;
++	pps_pixbuf_cache_set_selection_list (cache, &list);
++	check_selection (cache, 1.0, "drag update");
++	pps_document_model_set_scale (model, 1.5);
++	page_ready = FALSE;
++	pps_pixbuf_cache_set_page_range (cache, 0, 0, &list);
++	wait_for_page (cache);
++	check_selection (cache, 1.5, "zoom");
++	gtk_window_set_focus (GTK_WINDOW (window), NULL);
++	pps_pixbuf_cache_style_changed (cache);
++	check_selection (cache, 1.5, "unfocused");
++	pps_pixbuf_cache_set_selection_list (cache, NULL);
++	g_assert_null (pps_pixbuf_cache_get_selection_texture (cache, 0, 1.5));
++	g_clear_object (&cache_object);
++	gtk_window_destroy (GTK_WINDOW (window));
++	g_assert_cmpint (g_remove (path), ==, 0);
++	g_assert_cmpint (g_rmdir (dir), ==, 0);
++	return 0;
++}
+diff --git a/meson.build b/meson.build
+index f468a9a..7077f0f 100644
+--- a/meson.build
++++ b/meson.build
+@@ -368,6 +368,10 @@ if enable_file_tests
+   subdir('libview/tests')
+ endif
+ 
++if get_option('tests') and enable_pdf
++  subdir('libview/tests/downstream')
++endif
++
+ 
+ summary({'Build type'                 : get_option('buildtype'),
+          'Application ID'             : app_id,
+diff --git a/rust/papers-view/src/auto/view.rs b/rust/papers-view/src/auto/view.rs
+index 566f5e6..9185138 100644
+--- a/rust/papers-view/src/auto/view.rs
++++ b/rust/papers-view/src/auto/view.rs
+@@ -127,6 +127,11 @@ impl View {
+ 
+     #[cfg(feature = "v48")]
+     #[cfg_attr(docsrs, doc(cfg(feature = "v48")))]
++    #[doc(alias = "pps_view_commit_form_edits")]
++    pub fn commit_form_edits(&self) {
++        unsafe { ffi::pps_view_commit_form_edits(self.to_glib_none().0) }
++    }
++
+     #[doc(alias = "pps_view_get_selections")]
+     #[doc(alias = "get_selections")]
+     pub fn selections(&self) -> Vec<ViewSelection> {
+diff --git a/rust/papers-view/sys/src/lib.rs b/rust/papers-view/sys/src/lib.rs
+index a50fa7c..d08e90c 100644
+--- a/rust/papers-view/sys/src/lib.rs
++++ b/rust/papers-view/sys/src/lib.rs
+@@ -1619,6 +1619,7 @@ unsafe extern "C" {
+     pub fn pps_view_get_selected_text(view: *mut PpsView) -> *mut c_char;
+     #[cfg(feature = "v48")]
+     #[cfg_attr(docsrs, doc(cfg(feature = "v48")))]
++    pub fn pps_view_commit_form_edits(view: *mut PpsView);
+     pub fn pps_view_get_selections(view: *mut PpsView) -> *mut glib::GList;
+     pub fn pps_view_handle_link(view: *mut PpsView, link: *mut papers_document::PpsLink);
+     pub fn pps_view_has_selection(view: *mut PpsView) -> gboolean;
+diff --git a/shell/resources/pps-document-view.blp b/shell/resources/pps-document-view.blp
+index 6f27cd9..d25072e 100644
+--- a/shell/resources/pps-document-view.blp
++++ b/shell/resources/pps-document-view.blp
+@@ -616,7 +616,12 @@ template $PpsDocumentView: Adw.BreakpointBin {
+       }
+ 
+       Shortcut {
+-        trigger: "<Ctrl>S|<Ctrl><Shift>S";
++        trigger: "<Ctrl>S";
++        action: "action(doc.save)";
++      }
++
++      Shortcut {
++        trigger: "<Ctrl><Shift>S";
+         action: "action(doc.save-as)";
+       }
+ 
+diff --git a/shell/resources/pps-shortcuts-dialog.blp b/shell/resources/pps-shortcuts-dialog.blp
+index 2f9ba38..ec63f4f 100644
+--- a/shell/resources/pps-shortcuts-dialog.blp
++++ b/shell/resources/pps-shortcuts-dialog.blp
+@@ -20,9 +20,14 @@ Adw.ShortcutsDialog shortcuts_dialog {
+       accelerator: "<Ctrl><Shift>O";
+     }
+ 
++    Adw.ShortcutsItem {
++      title: C_("shortcut window", "Save Current Document");
++      accelerator: "<Ctrl>S";
++    }
++
+     Adw.ShortcutsItem {
+       title: C_("shortcut window", "Save Copy of Current Document");
+-      accelerator: "<Ctrl>S <Ctrl><Shift>S";
++      accelerator: "<Ctrl><Shift>S";
+     }
+ 
+     Adw.ShortcutsItem {
+diff --git a/shell/src/document_view.rs b/shell/src/document_view.rs
+index aad7da7..8bb24a9 100644
+--- a/shell/src/document_view.rs
++++ b/shell/src/document_view.rs
+@@ -166,6 +166,9 @@ mod imp {
+         pub(super) sidebar_was_open_before_find: Cell<bool>,
+         pub(super) sidebar_was_open_before_collapsed: Cell<bool>,
+         pub(super) close_after_save: Cell<bool>,
++        saving_toast: RefCell<Option<adw::Toast>>,
++        pub(super) save_dialog_open: Cell<bool>,
++        pub(super) save_failed: Cell<bool>,
+         pub(super) close_after_print: Cell<bool>,
+         pub(super) modified: Cell<bool>,
+         pub(super) progress_cancellable: RefCell<Option<gio::Cancellable>>,
+@@ -205,6 +208,7 @@ mod imp {
+ 
+         // Job
+         pub(super) save_job: RefCell<Option<papers_view::JobSave>>,
++        pub(super) pending_save_in_place: Cell<bool>,
+         pub(super) save_job_handler: RefCell<Option<glib::SignalHandlerId>>,
+     }
+ 
+@@ -790,10 +794,8 @@ mod imp {
+                 .expect("Failed to save folder path");
+         }
+ 
+-        pub(super) fn check_document_modified(&self) -> bool {
+-            let Some(document) = self.document() else {
+-                return false;
+-            };
++        pub(super) fn modified_description(&self) -> Option<String> {
++            let document = self.document()?;
+ 
+             let forms_modified = document
+                 .dynamic_cast_ref::<papers_document::DocumentForms>()
+@@ -804,7 +806,7 @@ mod imp {
+                 .map(|d| d.document_is_modified())
+                 .unwrap_or_default();
+ 
+-            let secondary_text = match (forms_modified, annots_modified) {
++            match (forms_modified, annots_modified) {
+                 (true, true) => Some(gettext(
+                     "Document contains new or modified annotations and form fields that have been filled out.",
+                 )),
+@@ -812,10 +814,15 @@ mod imp {
+                     "Document contains form fields that have been filled out.",
+                 )),
+                 (false, true) => Some(gettext("Document contains new or modified annotations.")),
++                (false, false) if self.save_failed.get() || document.is_modified() => {
++                    Some(gettext("Document contains unsaved changes."))
++                }
+                 (false, false) => None,
+-            };
++            }
++        }
+ 
+-            let Some(secondary_text) = secondary_text else {
++        fn check_document_modified(&self) -> bool {
++            let Some(secondary_text) = self.modified_description() else {
+                 return false;
+             };
+             let secondary_text_command =
+@@ -844,12 +851,8 @@ mod imp {
+                     self,
+                     move |_, response| {
+                         match response {
+-                            "yes" => {
+-                                obj.close_after_save.set(true);
+-                                obj.save_as();
+-                            }
++                            "yes" => obj.save_as(true),
+                             "no" => obj.parent_window().destroy(),
+-                            "cancel" => obj.close_after_save.set(false),
+                             _ => (),
+                         };
+                     }
+@@ -861,13 +864,36 @@ mod imp {
+             true
+         }
+ 
++        pub(super) fn cancel_close_after_save(&self) -> bool {
++            if let Some(toast) = self.saving_toast.take() {
++                toast.dismiss();
++            }
++            self.close_after_save.replace(false)
++        }
++
+         pub(super) fn close_handled(&self) -> glib::Propagation {
+-            self.save_settings();
++            if self.save_job.borrow().is_some() || self.pending_save_in_place.get() {
++                self.close_after_save.set(true);
++                if self.saving_toast.borrow().is_none() {
++                    let toast = adw::Toast::builder()
++                        .title(gettext(
++                            "Saving… This window will close when saving finishes.",
++                        ))
++                        .timeout(0)
++                        .build();
++                    self.saving_toast.replace(Some(toast.clone()));
++                    self.toast_overlay.add_toast(toast);
++                }
++                return glib::Propagation::Stop;
++            }
+ 
+-            if let Some(id) = self.modified_handler_id.take() {
+-                self.document().unwrap().disconnect(id);
++            if self.save_dialog_open.get() {
++                return glib::Propagation::Stop;
+             }
+ 
++            self.view.commit_form_edits();
++            self.save_settings();
++
+             if self.check_document_modified() {
+                 return glib::Propagation::Stop;
+             }
+@@ -933,6 +959,10 @@ impl PpsDocumentView {
+         self.imp().close_handled()
+     }
+ 
++    pub(crate) fn modified_description(&self) -> Option<String> {
++        self.imp().modified_description()
++    }
++
+     pub fn set_filenames(&self, display_name: &str, edit_name: &str) {
+         self.imp().set_filenames(display_name, edit_name);
+     }
+diff --git a/shell/src/document_view/actions.rs b/shell/src/document_view/actions.rs
+index 5048220..61997e5 100644
+--- a/shell/src/document_view/actions.rs
++++ b/shell/src/document_view/actions.rs
+@@ -157,6 +157,15 @@ impl imp::PpsDocumentView {
+                 ))
+                 .build(),
+             // Document related actions
++            gio::ActionEntryBuilder::new("save")
++                .activate(glib::clone!(
++                    #[weak(rename_to = obj)]
++                    self,
++                    move |_, _, _| {
++                        obj.cmd_save();
++                    }
++                ))
++                .build(),
+             gio::ActionEntryBuilder::new("save-as")
+                 .activate(glib::clone!(
+                     #[weak(rename_to = obj)]
+@@ -1012,8 +1021,12 @@ impl imp::PpsDocumentView {
+         self.rotate(90);
+     }
+ 
++    fn cmd_save(&self) {
++        self.save_in_place();
++    }
++
+     fn cmd_save_as(&self) {
+-        self.save_as();
++        self.save_as(false);
+     }
+ 
+     fn cmd_save_image_as(&self) {
+diff --git a/shell/src/document_view/io.rs b/shell/src/document_view/io.rs
+index ebb486a..c9c6184 100644
+--- a/shell/src/document_view/io.rs
++++ b/shell/src/document_view/io.rs
+@@ -35,18 +35,6 @@ impl imp::PpsDocumentView {
+         self.message_area.replace(area);
+     }
+ 
+-    pub(super) fn clear_save_job(&self) {
+-        if let Some(job) = self.save_job.take() {
+-            if !job.is_finished() {
+-                job.cancel();
+-            }
+-
+-            if let Some(id) = self.save_job_handler.take() {
+-                job.disconnect(id);
+-            }
+-        }
+-    }
+-
+     pub(super) fn reload_document(&self, document: Option<&Document>) {
+         self.set_document(document);
+ 
+@@ -248,6 +236,12 @@ impl imp::PpsDocumentView {
+             return;
+         }
+ 
++        if let Some(previous) = self.document()
++            && let Some(id) = self.modified_handler_id.take()
++        {
++            previous.disconnect(id);
++        }
++        self.save_failed.set(false);
+         self.model.set_document(document);
+ 
+         self.set_message_area(None);
+@@ -298,8 +292,10 @@ impl imp::PpsDocumentView {
+         let id = document.connect_modified_notify(glib::clone!(
+             #[weak(rename_to = obj)]
+             self,
+-            move |_| {
+-                obj.document_modified();
++            move |document| {
++                if document.is_modified() {
++                    obj.document_modified();
++                }
+             }
+         ));
+ 
+@@ -362,78 +358,168 @@ impl imp::PpsDocumentView {
+         self.obj().native().and_downcast::<gtk::Window>().unwrap()
+     }
+ 
+-    pub(super) fn save_as(&self) {
+-        let dialog = gtk::FileDialog::builder()
+-            .title(gettext("Save As…"))
+-            .modal(true)
+-            .initial_name(self.edit_name.borrow().clone())
+-            .initial_folder(&gio::File::for_path(self.default_save_directory()))
+-            .build();
++    pub(super) fn save_in_place(&self) {
++        if self.save_job.borrow().is_some() {
++            self.pending_save_in_place.set(true);
++            return;
++        }
+ 
+-        Document::factory_add_filters(&dialog, self.document().as_ref());
++        let Some(file) = self.file.borrow().clone() else {
++            self.save_as(false);
++            return;
++        };
++        self.start_save_job(&file, false);
++    }
+ 
+-        glib::spawn_future_local(glib::clone!(
++    fn start_save_job(&self, file: &gio::File, save_as: bool) {
++        let (Some(document), Some(source)) = (self.document(), self.file.borrow().clone()) else {
++            return;
++        };
++        self.view.commit_form_edits();
++        let had_unsaved_changes = self.save_failed.get() || document.is_modified();
++        let job = papers_view::JobSave::new(&document, &file.uri(), &source.uri());
++        let monitor_guard = self
++            .parent_window()
++            .downcast::<PpsWindow>()
++            .unwrap()
++            .suspend_file_monitor(file);
++
++        let destination = file.clone();
++        let id = job.connect_finished(glib::clone!(
+             #[weak(rename_to = obj)]
+             self,
+-            async move {
+-                let result = dialog.save_future(Some(&obj.parent_window())).await;
++            move |job| {
++                // Hold the monitor across the handoff to a queued save.
++                let _guard = &monitor_guard;
++                obj.save_job.take();
++                if let Some(id) = obj.save_job_handler.take() {
++                    job.disconnect(id);
++                }
+ 
+-                match result {
+-                    Err(_) => obj.close_after_save.set(false),
+-                    Ok(file) => {
+-                        obj.file_dialog_save_folder(Some(&file), UserDirectory::Documents);
++                if obj.document().as_ref() != Some(&document) {
++                    obj.cancel_close_after_save();
++                    obj.pending_save_in_place.set(false);
++                    return;
++                }
+ 
+-                        obj.clear_save_job();
++                if let Err(error) = job.is_succeeded() {
++                    // The backend can clear its flags after serialization even
++                    // when copying the temporary file to the destination fails.
++                    obj.save_failed
++                        .set(had_unsaved_changes || obj.modified.get() || document.is_modified());
++                    obj.pending_save_in_place.set(false);
++                    obj.cancel_close_after_save();
++                    obj.show_save_error(&document, &destination, save_as, &error);
++                    return;
++                }
+ 
+-                        let document = obj.document().unwrap();
+-                        let uri = file.uri();
+-                        let document_uri = obj.file.borrow().as_ref().unwrap().uri();
++                if save_as {
++                    gtk::RecentManager::default().add_item(&destination.uri());
++                }
++                obj.save_failed.set(false);
++                if obj.pending_save_in_place.replace(false) {
++                    obj.save_in_place();
++                    return;
++                }
+ 
+-                        let save_job = papers_view::JobSave::new(&document, &uri, &document_uri);
++                if !document.is_modified() {
++                    obj.modified.set(false);
++                    obj.update_title();
++                }
++                if obj.cancel_close_after_save() {
++                    let window = obj.parent_window();
++                    glib::idle_add_local_once(glib::clone!(
++                        #[weak]
++                        window,
++                        move || window.close()
++                    ));
++                }
++            }
++        ));
+ 
+-                        let id = save_job.connect_finished(glib::clone!(
+-                            #[weak]
+-                            obj,
+-                            move |job| {
+-                                match job.is_succeeded() {
+-                                    Err(e) => {
+-                                        obj.close_after_save.set(false);
+-                                        obj.error_message(
+-                                            Some(&e),
+-                                            &formatx!(
+-                                                gettext("The file could not be saved as “{}”."),
+-                                                job.uri().unwrap_or_default(),
+-                                            )
+-                                            .expect("Wrong format in translated string"),
+-                                        );
+-                                    }
+-                                    Ok(_) => {
+-                                        if let Some(uri) = job.uri() {
+-                                            gtk::RecentManager::default().add_item(&uri);
+-                                        }
+-                                    }
+-                                }
++        self.save_job.replace(Some(job.clone()));
++        self.save_job_handler.replace(Some(id));
++        job.scheduler_push_job(JobPriority::PriorityNone);
++    }
++
++    fn show_save_error(
++        &self,
++        document: &Document,
++        destination: &gio::File,
++        save_as: bool,
++        error: &glib::Error,
++    ) {
++        let message = formatx!(
++            gettext("The file could not be saved as “{}”."),
++            destination.parse_name(),
++        )
++        .expect("Wrong format in translated string");
++        let dialog = adw::AlertDialog::builder()
++            .heading(message)
++            .body(error.message())
++            .close_response("cancel")
++            .default_response("retry")
++            .build();
++        dialog.add_responses(&[
++            ("cancel", &gettext("_Cancel")),
++            ("save-as", &gettext("Save _As…")),
++            ("retry", &gettext("_Retry")),
++        ]);
++        dialog.set_response_appearance("retry", adw::ResponseAppearance::Suggested);
++        dialog.connect_response(
++            None,
++            glib::clone!(
++                #[weak(rename_to = obj)]
++                self,
++                #[strong]
++                destination,
++                #[strong]
++                document,
++                move |_, response| {
++                    if obj.save_job.borrow().is_some() || obj.document().as_ref() != Some(&document)
++                    {
++                        return;
++                    }
++                    match response {
++                        "retry" => obj.start_save_job(&destination, save_as),
++                        "save-as" => obj.save_as(false),
++                        _ => (),
++                    }
++                }
++            ),
++        );
++        dialog.present(Some(self.obj().as_ref()));
++    }
+ 
+-                                obj.clear_save_job();
++    pub(super) fn save_as(&self, close_after_save: bool) {
++        if self.save_job.borrow().is_some() || self.save_dialog_open.replace(true) {
++            return;
++        }
+ 
+-                                if obj.close_after_save.get() {
+-                                    glib::idle_add_local_once(glib::clone!(
+-                                        #[weak]
+-                                        obj,
+-                                        move || {
+-                                            obj.parent_window().destroy();
+-                                        }
+-                                    ));
+-                                }
+-                            }
+-                        ));
++        let dialog = gtk::FileDialog::builder()
++            .title(gettext("Save As…"))
++            .modal(true)
++            .initial_name(self.edit_name.borrow().clone())
++            .initial_folder(&gio::File::for_path(self.default_save_directory()))
++            .build();
+ 
+-                        obj.save_job.replace(Some(save_job.clone()));
+-                        obj.save_job_handler.replace(Some(id));
++        let document = self.document();
++        Document::factory_add_filters(&dialog, document.as_ref());
+ 
+-                        // The priority doesn't matter for this job
+-                        save_job.scheduler_push_job(JobPriority::PriorityNone);
+-                    }
++        glib::spawn_future_local(glib::clone!(
++            #[weak(rename_to = obj)]
++            self,
++            async move {
++                let result = dialog.save_future(Some(&obj.parent_window())).await;
++                obj.save_dialog_open.set(false);
++
++                if let Ok(file) = result
++                    && obj.document() == document
++                    && obj.save_job.borrow().is_none()
++                {
++                    obj.file_dialog_save_folder(Some(&file), UserDirectory::Documents);
++                    obj.close_after_save.set(close_after_save);
++                    obj.start_save_job(&file, true);
+                 }
+             }
+         ));
+diff --git a/shell/src/document_view/print.rs b/shell/src/document_view/print.rs
+index 398a88d..22252b6 100644
+--- a/shell/src/document_view/print.rs
++++ b/shell/src/document_view/print.rs
+@@ -121,12 +121,13 @@ impl imp::PpsDocumentView {
+         let n_jobs = self.print_queue.borrow().len();
+         self.update_pending_jobs_message(n_jobs);
+ 
+-        if self.print_queue.borrow().is_empty() && self.close_after_print.get() {
++        if n_jobs == 0 && self.close_after_print.replace(false) {
+             glib::idle_add_local_once(glib::clone!(
+                 #[weak(rename_to = obj)]
+                 self,
+                 move || {
+-                    obj.parent_window().destroy();
++                    obj.obj().set_sensitive(true);
++                    obj.parent_window().close();
+                 }
+             ));
+         }
+diff --git a/shell/src/document_view/signals.rs b/shell/src/document_view/signals.rs
+index 9d0ff27..df6534b 100644
+--- a/shell/src/document_view/signals.rs
++++ b/shell/src/document_view/signals.rs
+@@ -11,6 +11,7 @@ impl imp::PpsDocumentView {
+     #[template_callback]
+     pub(crate) fn doc_restrictions_changed(&self) {
+         let Some(document) = self.document() else {
++            self.set_action_enabled("save", false);
+             self.set_action_enabled("save-as", false);
+             self.set_action_enabled("print", false);
+             return;
+@@ -43,6 +44,7 @@ impl imp::PpsDocumentView {
+             }
+         }
+ 
++        self.set_action_enabled("save", ok_to_copy);
+         self.set_action_enabled("save-as", ok_to_copy);
+         self.set_action_enabled("print", ok_to_print);
+     }
+@@ -139,7 +141,7 @@ impl imp::PpsDocumentView {
+         match response {
+             "close-later" => {
+                 if self.print_queue.borrow().is_empty() {
+-                    self.parent_window().destroy();
++                    self.parent_window().close();
+                 } else {
+                     self.close_after_print.set(true);
+                 }
+diff --git a/shell/src/file_monitor.rs b/shell/src/file_monitor.rs
+index ffe20b5..34e7257 100644
+--- a/shell/src/file_monitor.rs
++++ b/shell/src/file_monitor.rs
+@@ -1,4 +1,5 @@
+ use super::*;
++use std::cell::Cell;
+ 
+ mod imp {
+     use super::*;
+@@ -8,8 +9,10 @@ mod imp {
+     pub struct PpsFileMonitor {
+         #[property(construct_only, get)]
+         pub(super) uri: RefCell<String>,
+-        pub(super) monitor: std::cell::OnceCell<gio::FileMonitor>,
++        pub(super) monitor: RefCell<Option<gio::FileMonitor>>,
+         pub(super) timeout_id: RefCell<Option<glib::SourceId>>,
++        pub(super) suspend_count: Cell<u32>,
++        pub(super) generation: Cell<u64>,
+     }
+ 
+     #[glib::object_subclass]
+@@ -27,13 +30,28 @@ mod imp {
+         }
+ 
+         fn constructed(&self) {
++            self.start();
++        }
++
++        fn dispose(&self) {
++            self.stop();
++        }
++    }
++
++    impl PpsFileMonitor {
++        pub(super) fn start(&self) {
+             let file = gio::File::for_uri(self.uri.borrow().as_ref());
+             match file.monitor_file(gio::FileMonitorFlags::NONE, gio::Cancellable::NONE) {
+                 Ok(monitor) => {
+                     monitor.connect_changed(glib::clone!(
+                         #[weak(rename_to = obj)]
+                         self,
+-                        move |_, _, _, event| {
++                        move |monitor, _, _, event| {
++                            // Events already queued by a cancelled monitor must not reload
++                            // a document after its own save has finished.
++                            if monitor.is_cancelled() {
++                                return;
++                            }
+                             match event {
+                                 gio::FileMonitorEvent::ChangesDoneHint => {
+                                     obj.timeout_stop();
+@@ -45,7 +63,7 @@ mod imp {
+                         }
+                     ));
+ 
+-                    self.monitor.set(monitor).unwrap();
++                    self.monitor.replace(Some(monitor));
+                 }
+                 Err(e) => {
+                     glib::g_warning!("", "{}", e.message());
+@@ -53,12 +71,12 @@ mod imp {
+             }
+         }
+ 
+-        fn dispose(&self) {
++        pub(super) fn stop(&self) {
+             self.timeout_stop();
++            if let Some(monitor) = self.monitor.take() {
++                monitor.cancel();
++            }
+         }
+-    }
+-
+-    impl PpsFileMonitor {
+         fn timeout_start(&self) {
+             self.timeout_stop();
+ 
+@@ -93,4 +111,151 @@ impl PpsFileMonitor {
+     pub fn new(uri: &str) -> Self {
+         glib::Object::builder().property("uri", uri).build()
+     }
++
++    pub fn is_suspended(&self) -> bool {
++        self.imp().suspend_count.get() > 0
++    }
++
++    pub fn generation(&self) -> u64 {
++        self.imp().generation.get()
++    }
++
++    pub fn suspend(&self) -> FileMonitorGuard {
++        let imp = self.imp();
++        imp.suspend_count.set(imp.suspend_count.get() + 1);
++        imp.generation.set(imp.generation.get().wrapping_add(1));
++        imp.stop();
++        FileMonitorGuard(self.clone())
++    }
++}
++
++// Keep the monitor suspended until the save callback is disconnected, including
++// error paths. A fresh monitor cannot receive notifications from the old write.
++pub struct FileMonitorGuard(PpsFileMonitor);
++
++impl Drop for FileMonitorGuard {
++    fn drop(&mut self) {
++        let imp = self.0.imp();
++        let count = imp.suspend_count.get() - 1;
++        imp.suspend_count.set(count);
++        if count == 0 {
++            imp.start();
++        }
++    }
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++    use std::rc::Rc;
++    use std::time::{Duration, Instant};
++
++    fn pump_for(duration: Duration) {
++        let context = glib::MainContext::default();
++        let until = Instant::now() + duration;
++        while Instant::now() < until {
++            while context.pending() {
++                context.iteration(false);
++            }
++            std::thread::sleep(Duration::from_millis(5));
++        }
++    }
++
++    #[test]
++    fn own_write_and_queued_events_are_ignored_but_external_writes_resume() {
++        let context = glib::MainContext::default();
++        let _context = context.acquire().unwrap();
++        let path = std::env::temp_dir().join(format!("papers-monitor-{}", std::process::id()));
++        std::fs::write(&path, b"original").unwrap();
++        let file = gio::File::for_path(&path);
++        let monitor = PpsFileMonitor::new(&file.uri());
++        let changes = Rc::new(Cell::new(0));
++        monitor.connect_closure(
++            "changed",
++            false,
++            glib::closure_local!(
++                #[strong]
++                changes,
++                move |_: PpsFileMonitor| changes.set(changes.get() + 1)
++            ),
++        );
++
++        for _ in 0..3 {
++            let old = monitor.imp().monitor.borrow().clone().unwrap();
++            let generation = monitor.generation();
++            let guard = monitor.suspend();
++            let nested_guard = monitor.suspend();
++            assert!(old.is_cancelled());
++            std::fs::write(&path, b"own save").unwrap();
++            pump_for(Duration::from_millis(300));
++            assert_eq!(changes.get(), 0);
++            drop(guard);
++            assert!(monitor.is_suspended());
++            drop(nested_guard);
++            assert!(!monitor.is_suspended());
++            assert_ne!(monitor.generation(), generation);
++
++            // Deliver a notification from the old monitor after save completion.
++            old.emit_by_name::<()>(
++                "changed",
++                &[
++                    &file,
++                    &Option::<gio::File>::None,
++                    &gio::FileMonitorEvent::ChangesDoneHint,
++                ],
++            );
++            pump_for(Duration::from_millis(300));
++            assert_eq!(changes.get(), 0);
++        }
++
++        std::fs::write(&path, b"external update after save").unwrap();
++        let deadline = Instant::now() + Duration::from_secs(3);
++        while changes.get() == 0 && Instant::now() < deadline {
++            pump_for(Duration::from_millis(20));
++        }
++        assert!(changes.get() > 0, "external updates must still be detected");
++        monitor.imp().stop();
++        std::fs::remove_file(path).unwrap();
++    }
++
++    #[test]
++    fn suspending_cancels_the_pending_reload_timeout() {
++        let context = glib::MainContext::default();
++        let _context = context.acquire().unwrap();
++        let path = std::env::temp_dir().join(format!("papers-timeout-{}", std::process::id()));
++        std::fs::write(&path, b"original").unwrap();
++        let file = gio::File::for_path(&path);
++        let monitor = PpsFileMonitor::new(&file.uri());
++        let changes = Rc::new(Cell::new(0));
++        monitor.connect_closure(
++            "changed",
++            false,
++            glib::closure_local!(
++                #[strong]
++                changes,
++                move |_: PpsFileMonitor| changes.set(changes.get() + 1)
++            ),
++        );
++        monitor
++            .imp()
++            .monitor
++            .borrow()
++            .as_ref()
++            .unwrap()
++            .emit_by_name::<()>(
++                "changed",
++                &[
++                    &file,
++                    &Option::<gio::File>::None,
++                    &gio::FileMonitorEvent::Changed,
++                ],
++            );
++        assert!(monitor.imp().timeout_id.borrow().is_some());
++        drop(monitor.suspend());
++        assert!(monitor.imp().timeout_id.borrow().is_none());
++        pump_for(Duration::from_secs(6));
++        assert_eq!(changes.get(), 0);
++        monitor.imp().stop();
++        std::fs::remove_file(path).unwrap();
++    }
+ }
+diff --git a/shell/src/meson.build b/shell/src/meson.build
+index db1bc7b..059d729 100644
+--- a/shell/src/meson.build
++++ b/shell/src/meson.build
+@@ -70,6 +70,8 @@ pps_library_path = '@0@/libview:@0@/libdocument:@0@/shell'.format(build_root)
+ test_env = cargo_env
+ test_env.set('DYLD_LIBRARY_PATH', pps_library_path)
+ test_env.set('LD_LIBRARY_PATH', pps_library_path)
++test_env.set('PPS_BACKENDS_DIR', build_root / 'libdocument/backend')
++test_env.set('GSETTINGS_SCHEMA_DIR', data_build_dir)
+ 
+ cargo_clippy = find_program('cargo-clippy', required: false)
+ if cargo_clippy.found()
+diff --git a/shell/src/window.rs b/shell/src/window.rs
+index aec51d4..9edfcd4 100644
+--- a/shell/src/window.rs
++++ b/shell/src/window.rs
+@@ -8,7 +8,7 @@ use glib::closure_local;
+ use gtk::TextDirection;
+ 
+ use futures::{FutureExt, future::LocalBoxFuture};
+-use papers_document::{DocumentAnnotations, DocumentMode, LinkAction, LinkActionType, LinkDest};
++use papers_document::{DocumentMode, LinkAction, LinkActionType, LinkDest};
+ use papers_view::JobLoad;
+ use papers_view::JobPriority;
+ use papers_view::SizingMode;
+@@ -132,10 +132,6 @@ mod imp {
+                 return glib::Propagation::Stop;
+             }
+ 
+-            if self.check_document_modified_reload() {
+-                return glib::Propagation::Stop;
+-            }
+-
+             self.parent_close_request()
+         }
+     }
+@@ -180,6 +176,20 @@ mod imp {
+             }
+         }
+ 
++        pub(super) fn suspend_file_monitor(
++            &self,
++            file: &gio::File,
++        ) -> Option<crate::file_monitor::FileMonitorGuard> {
++            let monitor = self.monitor.borrow().clone()?;
++            if !gio::File::for_uri(&monitor.uri()).equal(file) {
++                return None;
++            }
++
++            let guard = monitor.suspend();
++            self.clear_reload_job();
++            Some(guard)
++        }
++
+         fn set_mode(&self, mode: WindowRunMode) {
+             if self.mode.get() == mode {
+                 return;
+@@ -220,32 +230,8 @@ mod imp {
+             win.present();
+         }
+ 
+-        fn check_document_modified(&self) -> Option<String> {
+-            let document = self.document_view.model().document()?;
+-
+-            let forms_modified = document
+-                .dynamic_cast_ref::<papers_document::DocumentForms>()
+-                .map(|d| d.document_is_modified())
+-                .unwrap_or_default();
+-            let annots_modified = document
+-                .dynamic_cast_ref::<DocumentAnnotations>()
+-                .map(|d| d.document_is_modified())
+-                .unwrap_or_default();
+-
+-            match (forms_modified, annots_modified) {
+-                (true, true) => Some(gettext(
+-                    "Document contains new or modified annotations and form fields that have been filled out.",
+-                )),
+-                (true, false) => Some(gettext(
+-                    "Document contains form fields that have been filled out.",
+-                )),
+-                (false, true) => Some(gettext("Document contains new or modified annotations.")),
+-                (false, false) => None,
+-            }
+-        }
+-
+         fn check_document_modified_reload(&self) -> bool {
+-            let Some(secondary_text) = self.check_document_modified() else {
++            let Some(secondary_text) = self.document_view.modified_description() else {
+                 return false;
+             };
+             let secondary_text_command =
+@@ -771,11 +757,22 @@ mod imp {
+         }
+ 
+         fn file_changed(&self) {
++            let monitor = self.monitor.borrow().clone();
++            let generation = monitor.as_ref().map(PpsFileMonitor::generation);
+             if !self.check_document_modified_reload() {
+                 glib::spawn_future_local(glib::clone!(
+                     #[weak(rename_to = obj)]
+                     self,
+                     async move {
++                        // A save or a new document may have superseded this
++                        // notification before the queued future starts.
++                        if *obj.monitor.borrow() != monitor
++                            || monitor.as_ref().is_some_and(|monitor| {
++                                monitor.is_suspended() || Some(monitor.generation()) != generation
++                            })
++                        {
++                            return;
++                        }
+                         obj.reload_document().await;
+                     }
+                 ));
+@@ -1297,6 +1294,13 @@ impl PpsWindow {
+         self.imp().file.borrow().as_ref().map(|f| f.uri().into())
+     }
+ 
++    pub(crate) fn suspend_file_monitor(
++        &self,
++        file: &gio::File,
++    ) -> Option<crate::file_monitor::FileMonitorGuard> {
++        self.imp().suspend_file_monitor(file)
++    }
++
+     pub fn open(
+         &self,
+         file: &gio::File,
+@@ -1339,3 +1343,351 @@ impl Default for PpsWindow {
+         Self::new()
+     }
+ }
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++    use papers_document::DocumentAnnotations;
++    use std::rc::Rc;
++    use std::time::{Duration, Instant};
++
++    fn pump_until(mut condition: impl FnMut() -> bool) {
++        let context = glib::MainContext::default();
++        let deadline = Instant::now() + Duration::from_secs(10);
++        while !condition() && Instant::now() < deadline {
++            while context.pending() {
++                context.iteration(false);
++            }
++            std::thread::sleep(Duration::from_millis(5));
++        }
++        assert!(condition(), "timed out waiting for the document operation");
++    }
++
++    fn pump_for(duration: Duration) {
++        let until = Instant::now() + duration;
++        pump_until(|| Instant::now() >= until);
++    }
++
++    fn make_pdf() -> Vec<u8> {
++        let mut objects = vec![
++            "<< /Type /Catalog /Pages 2 0 R /AcroForm << /Fields [11 0 R] >> >>".to_string(),
++            "<< /Type /Pages /Count 8 /Kids [3 0 R 4 0 R 5 0 R 6 0 R 7 0 R 8 0 R 9 0 R 10 0 R] >>"
++                .to_string(),
++        ];
++        for page in 0..8 {
++            let annots = if page == 0 { "/Annots [11 0 R]" } else { "" };
++            objects.push(format!(
++                "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 600 800] /Resources << >> {annots} >>"
++            ));
++        }
++        objects.push(
++            "<< /Type /Annot /Subtype /Widget /FT /Tx /T (name) /Rect [10 10 90 30] /P 3 0 R >>"
++                .to_string(),
++        );
++        let mut pdf = "%PDF-1.4\n".to_string();
++        let mut offsets = Vec::new();
++        for (i, object) in objects.iter().enumerate() {
++            offsets.push(pdf.len());
++            pdf.push_str(&format!("{} 0 obj\n{}\nendobj\n", i + 1, object));
++        }
++        let xref = pdf.len();
++        pdf.push_str(&format!(
++            "xref\n0 {}\n0000000000 65535 f \n",
++            objects.len() + 1
++        ));
++        for offset in offsets {
++            pdf.push_str(&format!("{offset:010} 00000 n \n"));
++        }
++        pdf.push_str(&format!(
++            "trailer\n<< /Size {} /Root 1 0 R >>\nstartxref\n{xref}\n%%EOF\n",
++            objects.len() + 1
++        ));
++        pdf.into_bytes()
++    }
++
++    fn text_field(
++        document: &Document,
++    ) -> (papers_document::DocumentForms, papers_document::FormField) {
++        let forms = document
++            .clone()
++            .dynamic_cast::<papers_document::DocumentForms>()
++            .unwrap();
++        let field = forms
++            .form_fields(&document.page(0).unwrap())
++            .unwrap()
++            .nth(0)
++            .unwrap()
++            .data()
++            .and_downcast::<papers_document::FormField>()
++            .unwrap();
++        (forms, field)
++    }
++
++    fn assert_saved_text(file: &gio::File, expected: &str) {
++        let saved = Document::factory_get_document(&file.uri()).unwrap();
++        saved.load(&file.uri()).unwrap();
++        let (forms, field) = text_field(&saved);
++        assert_eq!(
++            forms.form_field_text_get_text(&field).as_deref(),
++            Some(expected)
++        );
++    }
++
++    // The worker has made its snapshot. Its finished callback still has to
++    // run on the main context, which we intentionally do not pump here.
++    fn save_until_serialized(
++        save: &gtk::Shortcut,
++        document_view: &PpsDocumentView,
++        document: &Document,
++    ) {
++        let (serialized, ready) = std::sync::mpsc::channel();
++        let handler = document.connect_modified_notify(move |doc| {
++            if !doc.is_modified() {
++                let _ = serialized.send(());
++            }
++        });
++        activate_shortcut(save, document_view);
++        ready.recv_timeout(Duration::from_secs(10)).unwrap();
++        document.disconnect(handler);
++    }
++
++    fn find_view(widget: &gtk::Widget) -> Option<papers_view::View> {
++        if let Ok(view) = widget.clone().downcast::<papers_view::View>() {
++            return Some(view);
++        }
++        let mut child = widget.first_child();
++        while let Some(widget) = child {
++            if let Some(view) = find_view(&widget) {
++                return Some(view);
++            }
++            child = widget.next_sibling();
++        }
++        None
++    }
++
++    fn trigger_contains(trigger: &gtk::ShortcutTrigger, expected: &gtk::ShortcutTrigger) -> bool {
++        if let Some(alternative) = trigger.downcast_ref::<gtk::AlternativeTrigger>() {
++            trigger_contains(&alternative.first(), expected)
++                || trigger_contains(&alternative.second(), expected)
++        } else {
++            trigger.to_str() == expected.to_str()
++        }
++    }
++
++    fn find_shortcuts(
++        widget: &gtk::Widget,
++        trigger: &gtk::ShortcutTrigger,
++        found: &mut Vec<(gtk::Widget, gtk::Shortcut)>,
++    ) {
++        let controllers = widget.observe_controllers();
++        for i in 0..controllers.n_items() {
++            let Some(controller) = controllers
++                .item(i)
++                .and_downcast::<gtk::ShortcutController>()
++            else {
++                continue;
++            };
++            for j in 0..controller.n_items() {
++                let shortcut = controller.item(j).and_downcast::<gtk::Shortcut>().unwrap();
++                if shortcut
++                    .trigger()
++                    .is_some_and(|t| trigger_contains(&t, trigger))
++                {
++                    found.push((widget.clone(), shortcut));
++                }
++            }
++        }
++        let mut child = widget.first_child();
++        while let Some(widget) = child {
++            find_shortcuts(&widget, trigger, found);
++            child = widget.next_sibling();
++        }
++    }
++
++    fn document_shortcut(
++        widget: &gtk::Widget,
++        accelerator: &str,
++        action_name: &str,
++    ) -> gtk::Shortcut {
++        let trigger = gtk::ShortcutTrigger::parse_string(accelerator).unwrap();
++        let mut found = Vec::new();
++        find_shortcuts(widget, &trigger, &mut found);
++        // GTK also creates signal shortcuts for the Save As menu button.
++        // Check the document's named shortcut, independent of those menu widgets.
++        found.retain(|(_, shortcut)| {
++            shortcut
++                .action()
++                .is_some_and(|a| a.is::<gtk::NamedAction>())
++        });
++        assert_eq!(found.len(), 1, "expected one binding for {accelerator}");
++        let (_, shortcut) = found.pop().unwrap();
++        let action = shortcut
++            .action()
++            .and_downcast::<gtk::NamedAction>()
++            .unwrap();
++        assert_eq!(
++            action.action_name(),
++            action_name,
++            "wrong action for {accelerator}"
++        );
++        shortcut
++    }
++
++    fn activate_shortcut(shortcut: &gtk::Shortcut, widget: &impl IsA<gtk::Widget>) {
++        assert!(shortcut.action().unwrap().activate(
++            gtk::ShortcutActionFlags::empty(),
++            widget,
++            shortcut.arguments().as_ref(),
++        ));
++    }
++
++    #[test]
++    fn in_place_save_keeps_document_page_and_scroll_and_external_reload_still_works() {
++        gtk::init().unwrap();
++        let context = glib::MainContext::default();
++        let _context = context.acquire().unwrap();
++        let app = PpsApplication::new();
++        app.register(gio::Cancellable::NONE).unwrap();
++        let window = PpsWindow::new();
++        let path =
++            std::env::temp_dir().join(format!("papers-save-view-{}.pdf", std::process::id()));
++        std::fs::write(&path, make_pdf()).unwrap();
++        let file = gio::File::for_path(&path);
++        window.open(&file, None, None);
++        window.present();
++        pump_until(|| window.document().is_some());
++        pump_for(Duration::from_millis(500));
++
++        let document_view = window.imp().document_view.clone();
++        // Resolve the shortcuts loaded from the compiled UI resource. Calling
++        // doc.save directly would miss a Ctrl+S accidentally bound to save-as.
++        let save = document_shortcut(document_view.upcast_ref(), "<Ctrl>S", "doc.save");
++        document_shortcut(document_view.upcast_ref(), "<Ctrl><Shift>S", "doc.save-as");
++        let model = document_view.model();
++        model.set_page(4);
++        pump_for(Duration::from_millis(500));
++        let view = find_view(document_view.upcast_ref::<gtk::Widget>()).unwrap();
++        let scroll = view.dynamic_cast::<gtk::Scrollable>().unwrap();
++        let vertical = scroll.vadjustment().unwrap();
++        vertical.set_value(vertical.value() + 120.0);
++        pump_for(Duration::from_secs(2));
++        let page = model.page();
++        let scroll = vertical.value();
++        let document = window.document().unwrap();
++        let reloads = Rc::new(Cell::new(0));
++        model.connect_document_notify(glib::clone!(
++            #[strong]
++            reloads,
++            move |_| reloads.set(reloads.get() + 1)
++        ));
++
++        for cycle in 0..3 {
++            // Also cancel a reload that was queued before this save began.
++            window
++                .imp()
++                .monitor
++                .borrow()
++                .as_ref()
++                .unwrap()
++                .emit_by_name::<()>("changed", &[]);
++            let annotation = papers_document::AnnotationText::new(&document.page(4).unwrap());
++            annotation.set_contents(&format!("save cycle {cycle}"));
++            document
++                .dynamic_cast_ref::<DocumentAnnotations>()
++                .unwrap()
++                .add_annotation(&annotation);
++            activate_shortcut(&save, &document_view);
++            // A repeated Ctrl+S must not cancel the running save or its guard.
++            activate_shortcut(&save, &document_view);
++            pump_until(|| {
++                !window
++                    .imp()
++                    .monitor
++                    .borrow()
++                    .as_ref()
++                    .unwrap()
++                    .is_suspended()
++            });
++            // Cover both immediate monitor events and the five-second fallback.
++            pump_for(Duration::from_secs(6));
++            assert_eq!(reloads.get(), 0, "own saves must not replace the document");
++            assert_eq!(window.document(), Some(document.clone()));
++            assert_eq!(model.page(), page);
++            assert!(
++                (vertical.value() - scroll).abs() < 0.01,
++                "save changed the scroll position from {scroll} to {} in cycle {cycle}",
++                vertical.value()
++            );
++            let saved = Document::factory_get_document(&file.uri()).unwrap();
++            saved.load(&file.uri()).unwrap();
++            assert_eq!(saved.n_pages(), 8);
++            let annotations = saved
++                .dynamic_cast_ref::<DocumentAnnotations>()
++                .unwrap()
++                .annotations(&saved.page(4).unwrap());
++            assert_eq!(annotations.len(), cycle + 1);
++        }
++
++        // The backend clears its flags when serialization succeeds. Force
++        // transfer failure after that stage, then retry the same live edits.
++        let (forms, field) = text_field(&document);
++        forms.form_field_text_set_text(&field, "RetryMe");
++        let backup = path.with_extension("backup.pdf");
++        std::fs::rename(&path, &backup).unwrap();
++        std::fs::create_dir(&path).unwrap();
++        save_until_serialized(&save, &document_view, &document);
++        window.close();
++        assert!(window.is_visible());
++        pump_until(|| window.visible_dialog().is_some());
++        assert!(path.is_dir());
++        assert!(window.is_visible());
++        assert!(!document.is_modified());
++        assert!(document_view.modified_description().is_some());
++        assert_eq!(reloads.get(), 0);
++        std::fs::remove_dir(&path).unwrap();
++        std::fs::rename(&backup, &path).unwrap();
++
++        let dialog = window
++            .visible_dialog()
++            .and_downcast::<adw::AlertDialog>()
++            .unwrap();
++        dialog
++            .default_widget()
++            .and_downcast::<gtk::Button>()
++            .unwrap()
++            .emit_clicked();
++        pump_until(|| {
++            !window
++                .imp()
++                .monitor
++                .borrow()
++                .as_ref()
++                .unwrap()
++                .is_suspended()
++        });
++        assert!(window.is_visible());
++        assert!(document_view.modified_description().is_none());
++        assert_saved_text(&file, "RetryMe");
++
++        // An external edit still reloads after the successful retry.
++        std::fs::write(&path, make_pdf()).unwrap();
++        pump_until(|| reloads.get() > 0);
++
++        let document = window.document().unwrap();
++        let (forms, field) = text_field(&document);
++        forms.form_field_text_set_text(&field, "First");
++        save_until_serialized(&save, &document_view, &document);
++        forms.form_field_text_set_text(&field, "Second");
++        activate_shortcut(&save, &document_view);
++        window.close();
++        window.close();
++        assert!(
++            window.is_visible(),
++            "the window closed before the queue finished"
++        );
++        pump_until(|| !window.is_visible());
++        assert_saved_text(&file, "Second");
++        papers_view::Job::scheduler_wait();
++        std::fs::remove_file(path).unwrap();
++    }
++}
